@@ -23,6 +23,7 @@ Speaker Audio Output (`src/audio/output.py`)     - System Speaker Playback
 ## Features & Principles
 
 - **Modular Architecture**: Every AI component (Mic, VAD, STT, LLM, TTS, Speaker) is decoupled behind abstract interface classes (`ABC`) and wired via dependency injection inside `VoicePipeline`.
+- **Tailscale Offloading (Client / Server Mode)**: Run on a low-spec laptop as a lightweight audio client (`Microphone` + `VAD` + `Speaker`), while offloading heavy AI processing (`Whisper STT`, `Ollama LLM`, `Kokoro TTS`) over a Tailscale private network to a remote PC.
 - **CPU Default / GPU Configurable**: Default settings run efficiently on CPU without requiring CUDA or heavy GPU setup. Device configuration can be switched to GPU via environment variables (`WHISPER_DEVICE=cuda`, `VAD_DEVICE=cuda`).
 - **Local Ollama Integration**: Communicates with local Ollama service for Qwen LLM inferencing (`http://localhost:11434`).
 - **Independent Component Testing**: Each module includes isolated unit test coverage under `tests/`.
@@ -137,11 +138,38 @@ pip install -r requirements.txt
 python -m unittest discover -s tests
 ```
 
-### 3. Run the Voice Pipeline
+### 3. Execution Modes
 
+#### Mode A: Standalone (All models run on one machine)
 ```bash
 python main.py
+# or
+python main.py --mode standalone
 ```
+
+#### Mode B: Offloading over Tailscale (Low-Spec Laptop + Remote PC)
+
+1. **On your Remote PC (Powerful Host with Ollama / GPU)**:
+   - Ensure Tailscale is running. Note down your PC's Tailscale IP (e.g. `100.x.y.z` from `tailscale status` or the Tailscale app).
+   - Ensure Ollama is running:
+     ```bash
+     ollama serve
+     ```
+   - Start the remote processing server:
+     ```bash
+     python main.py --mode server
+     # or: python server.py
+     ```
+     *(This loads Whisper STT and Kokoro TTS and exposes HTTP endpoints on port 8000).*
+
+2. **On your Laptop (Lightweight Audio Client)**:
+   - Ensure Tailscale is running on the laptop.
+   - Run the client pointing to your remote PC's Tailscale address:
+     ```bash
+     python main.py --mode client --server-url http://100.x.y.z:8000
+     ```
+     *(Or set `PIPELINE_MODE=client` and `REMOTE_SERVER_URL=http://100.x.y.z:8000` in `.env`).*
+   - Your laptop will now only capture microphone audio, detect speech using Silero VAD, stream the audio over Tailscale, and play the AI voice through your laptop's speakers!
 
 ---
 

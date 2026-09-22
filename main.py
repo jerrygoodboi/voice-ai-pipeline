@@ -74,8 +74,12 @@ def main() -> None:
     if config.pipeline_mode == "client":
         logger.info("  REMOTE_SERVER_URL: %s", config.remote_server_url)
     else:
-        logger.info("  OLLAMA_BASE_URL: %s", config.ollama_base_url)
-        logger.info("  OLLAMA_MODEL: %s", config.ollama_model)
+        logger.info("  LLM_PROVIDER: %s", config.llm_provider)
+        if config.llm_provider.lower() == "gemini":
+            logger.info("  GEMINI_MODEL: %s", config.gemini_model)
+        else:
+            logger.info("  OLLAMA_BASE_URL: %s", config.ollama_base_url)
+            logger.info("  OLLAMA_MODEL: %s", config.ollama_model)
         logger.info("  WHISPER_MODEL: %s", config.whisper_model)
         logger.info("  WHISPER_DEVICE: %s", config.whisper_device)
         logger.info("  KOKORO_VOICE: %s", config.kokoro_voice)

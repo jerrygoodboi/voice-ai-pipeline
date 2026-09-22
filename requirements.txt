@@ -12,9 +12,10 @@ onnxruntime>=1.17.0
 # Speech-to-Text (Whisper STT)
 faster-whisper>=1.0.0
 
-# LLM Integration (Ollama + Qwen)
+# LLM Integration (Ollama + Qwen / Gemini)
 requests>=2.31.0
 python-dotenv>=1.0.0
+google-genai>=0.1.0
 
 # Text-to-Speech (Kokoro TTS)
 kokoro-onnx>=0.6.1

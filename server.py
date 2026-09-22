@@ -14,8 +14,8 @@ import uvicorn
 
 from config.config import PipelineConfig, get_config
 from src.stt.whisper import WhisperSTT, BaseSTT
-from src.llm.qwen import QwenLLM, BaseLLM
-from src.tts.kokoro import KokoroTTS, BaseTTS
+from src.llm import BaseLLM, create_llm_engine
+from src.tts.kokoro import BaseTTS, KokoroTTS
 
 # Configure logging
 logging.basicConfig(
@@ -45,7 +45,7 @@ def create_app(
 
     app = FastAPI(
         title="Voice AI Pipeline Remote Server",
-        description="Offload Voice AI processing (Whisper, Ollama/Qwen, Kokoro) over Tailscale",
+        description="Offload Voice AI processing (Whisper, LLM, Kokoro) over Tailscale",
         version="1.0.0",
     )
 
@@ -56,10 +56,7 @@ def create_app(
         device=cfg.whisper_device,
         compute_type=cfg.whisper_compute_type,
     )
-    _llm = llm or QwenLLM(
-        base_url=cfg.ollama_base_url,
-        model_name=cfg.ollama_model,
-    )
+    _llm = llm or create_llm_engine(cfg)
     _tts = tts or KokoroTTS(
         voice=cfg.kokoro_voice,
         sample_rate=cfg.sample_rate,
@@ -74,8 +71,10 @@ def create_app(
             "status": "healthy",
             "whisper_model": cfg.whisper_model,
             "whisper_device": cfg.whisper_device,
+            "llm_provider": cfg.llm_provider,
             "ollama_base_url": cfg.ollama_base_url,
             "ollama_model": cfg.ollama_model,
+            "gemini_model": cfg.gemini_model,
             "ollama_reachable": ollama_ok,
             "kokoro_voice": cfg.kokoro_voice,
         }
@@ -174,7 +173,11 @@ def main() -> None:
     logger.info("  Host: %s", config.server_host)
     logger.info("  Port: %d", config.server_port)
     logger.info("  Whisper Model: %s (%s)", config.whisper_model, config.whisper_device)
-    logger.info("  Ollama Model: %s at %s", config.ollama_model, config.ollama_base_url)
+    logger.info("  LLM Provider: %s", config.llm_provider)
+    if config.llm_provider.lower() == "gemini":
+        logger.info("  Gemini Model: %s", config.gemini_model)
+    else:
+        logger.info("  Ollama Model: %s at %s", config.ollama_model, config.ollama_base_url)
     logger.info("  Kokoro Voice: %s (%s)", config.kokoro_voice, config.kokoro_device)
 
     app = create_app(config=config)

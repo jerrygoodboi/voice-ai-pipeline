@@ -89,6 +89,13 @@ class GeminiLLM(BaseLLM):
             f"?key={self.api_key}"
         )
 
+        gen_config = {
+            "temperature": 0.7,
+            "maxOutputTokens": 300,
+        }
+        if "gemini-3" in self.model_name.lower():
+            gen_config["thinkingConfig"] = {"thinkingBudget": 0}
+
         payload = {
             "contents": [
                 {
@@ -99,10 +106,7 @@ class GeminiLLM(BaseLLM):
             "systemInstruction": {
                 "parts": [{"text": SYSTEM_INSTRUCTION}]
             },
-            "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 100,
-            },
+            "generationConfig": gen_config,
         }
 
         max_attempts = 2
@@ -112,42 +116,90 @@ class GeminiLLM(BaseLLM):
                 if response.status_code == 200:
                     data = response.json()
                     candidates = data.get("candidates", [])
+                    prompt_feedback = data.get("promptFeedback", {})
+                    block_reason = prompt_feedback.get("blockReason")
+                    finish_reason = candidates[0].get("finishReason") if candidates else None
+
+                    text = ""
                     if candidates:
                         content = candidates[0].get("content", {})
                         parts = content.get("parts", [])
                         if parts:
                             text = parts[0].get("text", "").strip()
-                            logger.info("[LLM] Gemini response received: %s", text)
-                            return text
-                    return "[Gemini Error: Received empty response from API]"
-                elif response.status_code == 503:
+
+                    if text:
+                        logger.info("[LLM] GEMINI RESPONSE: '%s'", text)
+                        return text
+
                     logger.warning(
-                        "[LLM] Model '%s' 503 high demand. Retrying with 'gemini-flash-lite-latest'...",
+                        "[LLM] Gemini returned an empty response. Model: %s | Candidate count: %d | Finish reason: %s | Block reason: %s | Response: %s",
                         self.model_name,
+                        len(candidates),
+                        finish_reason,
+                        block_reason,
+                        data,
                     )
+                    return "I am sorry, I couldn't generate a response for that."
+                elif response.status_code in (429, 503):
+                    logger.warning(
+                        "[LLM] Model '%s' HTTP %d (rate limit/high demand). Retrying with backoff and fallback model...",
+                        self.model_name,
+                        response.status_code,
+                    )
+                    import time
+                    time.sleep(1.5)
+
                     fallback_url = (
                         f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent"
                         f"?key={self.api_key}"
                     )
-                    fb_resp = self.session.post(fallback_url, json=payload, timeout=self.timeout)
+                    fb_payload = {
+                        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                        "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+                        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 300},
+                    }
+                    fb_resp = self.session.post(fallback_url, json=fb_payload, timeout=self.timeout)
                     if fb_resp.status_code == 200:
                         data = fb_resp.json()
                         candidates = data.get("candidates", [])
+                        prompt_feedback = data.get("promptFeedback", {})
+                        block_reason = prompt_feedback.get("blockReason")
+                        finish_reason = candidates[0].get("finishReason") if candidates else None
+
+                        text = ""
                         if candidates:
                             content = candidates[0].get("content", {})
                             parts = content.get("parts", [])
                             if parts:
                                 text = parts[0].get("text", "").strip()
-                                logger.info("[LLM] Gemini fallback response received: %s", text)
-                                return text
-                    return "[Gemini Error: Service temporarily unavailable (503)]"
+
+                        if text:
+                            logger.info("[LLM] GEMINI RESPONSE: '%s'", text)
+                            return text
+
+                        logger.warning(
+                            "[LLM] Gemini fallback returned empty text response. Model: gemini-flash-lite-latest | Candidate count: %d | Finish reason: %s | Block reason: %s",
+                            len(candidates),
+                            finish_reason,
+                            block_reason,
+                        )
+                    else:
+                        logger.error(
+                            "[LLM] Gemini fallback failed [%d]: %s",
+                            fb_resp.status_code,
+                            fb_resp.text,
+                        )
+
+                    if response.status_code == 429 or fb_resp.status_code == 429:
+                        return "I am currently receiving too many requests. Please try again in a few seconds."
+                    return "I am sorry, the AI service is currently unavailable. Please try again shortly."
                 else:
                     logger.error(
                         "[LLM] Gemini request failed [%d]: %s",
                         response.status_code,
                         response.text,
                     )
-                    return f"[Gemini Error: HTTP {response.status_code}]"
+                    return "I am sorry, the AI service encountered an error."
 
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as net_err:
                 if attempt < max_attempts:

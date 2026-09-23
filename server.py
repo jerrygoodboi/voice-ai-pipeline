@@ -3,9 +3,12 @@ Voice AI Pipeline Remote Processing Server.
 Exposes Whisper STT, Qwen LLM via Ollama, and Kokoro TTS as HTTP endpoints over Tailscale.
 """
 
+import io
 import logging
 import sys
+import subprocess
 import urllib.parse
+import wave
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, Response
@@ -16,6 +19,8 @@ from config.config import PipelineConfig, get_config
 from src.stt.whisper import WhisperSTT, BaseSTT
 from src.llm import BaseLLM, create_llm_engine
 from src.tts.kokoro import BaseTTS, KokoroTTS
+
+from src.tts.factory import get_tts_engine
 
 # Configure logging
 logging.basicConfig(
@@ -34,8 +39,96 @@ class SynthesizeRequest(BaseModel):
     text: str
 
 
+def decode_input_audio(body: bytes, sample_rate: int = 16000) -> np.ndarray:
+    """
+    Decode incoming audio bytes (raw float32, WAV, WebM, OGG, MP3) to 1D float32 numpy array.
+    """
+    if not body:
+        return np.array([], dtype=np.float32)
+
+    # 1. Try Python wave module for standard WAV headers
+    if body.startswith(b"RIFF") and b"WAVE" in body[:12]:
+        try:
+            with wave.open(io.BytesIO(body), "rb") as wf:
+                n_channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                frames = wf.readframes(wf.getnframes())
+                if sampwidth == 2:
+                    raw_int16 = np.frombuffer(frames, dtype=np.int16)
+                    if n_channels > 1:
+                        raw_int16 = raw_int16[::n_channels]
+                    return raw_int16.astype(np.float32) / 32768.0
+                elif sampwidth == 4:
+                    raw_f32 = np.frombuffer(frames, dtype=np.float32)
+                    if n_channels > 1:
+                        raw_f32 = raw_f32[::n_channels]
+                    return raw_f32
+        except Exception as e:
+            logger.debug("[Server] Wave decode exception: %s", e)
+
+    # 2. Check for container magic headers (WebM, OGG, MP3, RIFF) -> decode via ffmpeg FIRST
+    is_container = (
+        body.startswith(b"\x1a\x45\xdf\xa3")  # WebM / EBML
+        or body.startswith(b"OggS")            # OGG
+        or body.startswith(b"ID3")             # MP3 ID3
+        or body.startswith(b"\xff\xfb")        # MP3 sync frame
+        or body.startswith(b"RIFF")            # RIFF container
+    )
+
+    if is_container:
+        cmd = [
+            "ffmpeg",
+            "-loglevel", "error",
+            "-i", "pipe:0",
+            "-f", "f32le",
+            "-ac", "1",
+            "-ar", str(sample_rate),
+            "pipe:1",
+        ]
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out, err = proc.communicate(input=body)
+            if proc.returncode == 0 and len(out) > 0:
+                return np.frombuffer(out, dtype=np.float32)
+        except Exception as e:
+            logger.debug("[Server] ffmpeg decode exception: %s", e)
+
+    # 3. Try direct float32 array interpretation for raw headerless PCM stream
+    try:
+        arr = np.frombuffer(body, dtype=np.float32)
+        if len(arr) > 0 and not np.isnan(arr).any() and np.max(np.abs(arr)) <= 1.0:
+            return arr
+    except Exception:
+        pass
+
+    # 4. Fallback ffmpeg attempt for any unrecognized audio format
+    cmd = [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-i", "pipe:0",
+        "-f", "f32le",
+        "-ac", "1",
+        "-ar", str(sample_rate),
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = proc.communicate(input=body)
+        if proc.returncode == 0 and len(out) > 0:
+            return np.frombuffer(out, dtype=np.float32)
+    except Exception as e:
+        logger.debug("[Server] Fallback ffmpeg decode exception: %s", e)
+
+    return np.array([], dtype=np.float32)
+
+
+
+from src.vad.silero_vad import BaseVAD, SileroVAD
+
+
 def create_app(
     config: PipelineConfig | None = None,
+    vad: BaseVAD | None = None,
     stt: BaseSTT | None = None,
     llm: BaseLLM | None = None,
     tts: BaseTTS | None = None,
@@ -45,23 +138,36 @@ def create_app(
 
     app = FastAPI(
         title="Voice AI Pipeline Remote Server",
-        description="Offload Voice AI processing (Whisper, LLM, Kokoro) over Tailscale",
+        description="Offload Voice AI processing (Whisper, LLM, Piper/Kokoro) over Tailscale & Web UI",
         version="1.0.0",
+    )
+
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["X-Sample-Rate", "X-Transcription", "X-Response-Text"],
     )
 
     # Initialize server-side AI engines
     logger.info("[Server] Initializing server-side models...")
+    _vad = vad or SileroVAD(
+        threshold=cfg.vad_threshold,
+        min_speech_duration=cfg.vad_min_speech_duration,
+        min_silence_duration=cfg.vad_min_silence_duration,
+        sample_rate=cfg.sample_rate,
+        device=cfg.vad_device,
+    )
     _stt = stt or WhisperSTT(
         model_name=cfg.whisper_model,
         device=cfg.whisper_device,
         compute_type=cfg.whisper_compute_type,
     )
     _llm = llm or create_llm_engine(cfg)
-    _tts = tts or KokoroTTS(
-        voice=cfg.kokoro_voice,
-        sample_rate=cfg.sample_rate,
-        device=cfg.kokoro_device,
-    )
+    _tts = tts or get_tts_engine(cfg)
 
     @app.get("/health")
     async def health_check():
@@ -83,40 +189,69 @@ def create_app(
     async def process_speech(request: Request, sample_rate: int = 16000):
         """
         End-to-end processing of a speech segment:
-        1. Whisper STT
-        2. Ollama LLM
-        3. Kokoro TTS
+        1. Silero VAD
+        2. Whisper STT
+        3. Gemini / Qwen LLM
+        4. Piper / Kokoro TTS
         Returns synthesized audio bytes and metadata headers.
         """
         body = await request.body()
         if not body:
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-        speech_segment = np.frombuffer(body, dtype=np.float32)
-        if len(speech_segment) == 0:
+        logger.info("[AUDIO] AUDIO RECEIVED (%d bytes)", len(body))
+
+        audio_chunk = decode_input_audio(body, sample_rate)
+        if len(audio_chunk) == 0:
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-        # 1. Transcribe speech
+        # Process audio chunk through Silero VAD
+        chunk_size = 512
+        speech_segment = None
+        for i in range(0, len(audio_chunk), chunk_size):
+            sub_chunk = audio_chunk[i : i + chunk_size]
+            if len(sub_chunk) == chunk_size:
+                seg = _vad.process_chunk(sub_chunk)
+                if seg is not None:
+                    speech_segment = seg
+
+        if speech_segment is None:
+            if _vad.speech_chunks:
+                speech_segment = np.concatenate(_vad.speech_chunks)
+                _vad.reset()
+            elif len(audio_chunk) >= int(sample_rate * cfg.vad_min_speech_duration):
+                speech_segment = audio_chunk
+
+        if speech_segment is None or len(speech_segment) == 0:
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        # 1. Transcribe speech with Whisper STT
         transcription = _stt.transcribe(speech_segment)
         if not transcription or not transcription.strip():
             logger.info("[Server] Silence or empty transcription detected.")
+            _vad.reset()
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-        logger.info("[Server] Transcribed: '%s'", transcription)
+        logger.info("[STT] TRANSCRIPTION: '%s'", transcription)
 
         # 2. LLM response generation
         ai_response = _llm.generate_response(transcription)
         if not ai_response or not ai_response.strip():
             logger.warning("[Server] Empty response received from LLM.")
+            _vad.reset()
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-        logger.info("[Server] LLM Response: '%s'", ai_response)
+        logger.info("[LLM] GEMINI RESPONSE: '%s'", ai_response)
 
         # 3. TTS audio synthesis
         audio_data, out_sr = _tts.synthesize(ai_response)
         if audio_data is None or len(audio_data) == 0:
             logger.warning("[Server] TTS synthesis produced no audio.")
+            _vad.reset()
             return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        logger.info("[TTS] PIPER SYNTHESIS: %d samples", len(audio_data))
+        _vad.reset()
 
         audio_bytes = audio_data.astype(np.float32).tobytes()
 
@@ -139,7 +274,7 @@ def create_app(
         body = await request.body()
         if not body:
             return JSONResponse({"text": ""})
-        audio_array = np.frombuffer(body, dtype=np.float32)
+        audio_array = decode_input_audio(body, sample_rate)
         text = _stt.transcribe(audio_array)
         return JSONResponse({"text": text})
 
@@ -162,6 +297,11 @@ def create_app(
             media_type="application/octet-stream",
             headers={"X-Sample-Rate": str(out_sr)},
         )
+
+    import os
+    if os.path.exists("web"):
+        from fastapi.staticfiles import StaticFiles
+        app.mount("/", StaticFiles(directory="web", html=True), name="static")
 
     return app
 

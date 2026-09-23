@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Voice AI Assistant - Smart Chat Interface</title>
+  <meta name="description" content="A modern, high-performance voice and text interface for Voice AI Assistant powered by Gemini & Local TTS.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Top Header -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+            <line x1="12" y1="19" x2="12" y2="22"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1>Voice AI Assistant</h1>
+          <span class="sub-text">Hybrid Pipeline (Silero • Whisper • Gemini • TTS)</span>
+        </div>
+      </div>
+      <div class="status-badge" id="statusBadge">
+        <span class="status-dot"></span>
+        <span class="status-text" id="statusText">Ready</span>
+      </div>
+    </header>
+
+    <!-- Main Chat Feed Area -->
+    <main class="chat-container" id="chatContainer">
+      <!-- Welcome Message -->
+      <div class="message assistant-message">
+        <div class="avatar assistant-avatar">AI</div>
+        <div class="message-content">
+          <div class="sender-name">Gemini Voice AI</div>
+          <div class="message-text">
+            Hello! I am your Voice AI Assistant. You can speak to me by clicking the microphone button below or type a message. How can I help you today?
+          </div>
+          <span class="timestamp">Just now</span>
+        </div>
+      </div>
+    </main>
+
+    <!-- Recording Live Transcript Banner -->
+    <div class="recording-banner hidden" id="recordingBanner">
+      <div class="pulse-indicator">
+        <span class="ping-circle"></span>
+        <span class="solid-circle"></span>
+      </div>
+      <div class="banner-text">
+        <span class="banner-label">Listening...</span>
+        <span class="live-transcript" id="liveTranscriptText">Speak now... (Simulating speech recognition)</span>
+      </div>
+      <div class="waveform-mini">
+        <span class="bar"></span>
+        <span class="bar"></span>
+        <span class="bar"></span>
+        <span class="bar"></span>
+        <span class="bar"></span>
+      </div>
+    </div>
+
+    <!-- Bottom Input Bar -->
+    <footer class="input-section">
+      <form class="input-form" id="chatForm">
+        <input 
+          type="text" 
+          id="messageInput" 
+          class="message-input" 
+          placeholder="Type your message or click microphone..." 
+          autocomplete="off"
+        >
+        <div class="action-buttons">
+          <button type="submit" class="btn-send" id="sendBtn" title="Send message">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"></line>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+            </svg>
+          </button>
+          
+          <button type="button" class="btn-mic" id="micBtn" title="Click to start/stop recording">
+            <svg class="mic-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <line x1="12" y1="19" x2="12" y2="22"/>
+            </svg>
+            <span class="mic-pulse"></span>
+          </button>
+        </div>
+      </form>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

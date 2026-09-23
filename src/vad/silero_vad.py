@@ -167,7 +167,7 @@ class SileroVAD(BaseVAD):
 
         if speech_detected:
             if not self.is_speaking:
-                logger.info("[VAD] Speech started")
+                logger.info("[VAD] VAD SPEECH START")
                 self.is_speaking = True
                 self.speech_chunks.clear()
                 self.speech_duration = 0.0
@@ -182,7 +182,7 @@ class SileroVAD(BaseVAD):
                 self.silence_duration += chunk_duration
 
                 if self.silence_duration >= self.min_silence_duration:
-                    logger.info("[VAD] Speech ended")
+                    logger.info("[VAD] VAD SPEECH END")
                     self.is_speaking = False
 
                     if self.speech_duration >= self.min_speech_duration and self.speech_chunks:

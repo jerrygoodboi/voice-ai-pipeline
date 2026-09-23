@@ -34,7 +34,7 @@ class PipelineConfig:
 
     # Gemini Settings
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
 
     # Ollama / Qwen Settings
     ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")

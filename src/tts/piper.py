@@ -61,10 +61,22 @@ class PiperTTS(BaseTTS):
                 self.voice_model = None
 
         self.piper_bin = shutil.which("piper")
+        if self.piper_bin and os.path.isdir(self.piper_bin):
+            piper_exe = os.path.join(self.piper_bin, "piper.exe")
+            if os.path.exists(piper_exe):
+                self.piper_bin = piper_exe
+            else:
+                self.piper_bin = None
+
         if not self.piper_bin:
-            home_piper = os.path.expanduser("~/.local/bin/piper")
-            if os.path.exists(home_piper):
-                self.piper_bin = home_piper
+            # Check local bin or common locations
+            home_piper_exe = os.path.expanduser("~/.local/bin/piper/piper.exe")
+            if os.path.exists(home_piper_exe):
+                self.piper_bin = home_piper_exe
+            else:
+                home_piper = os.path.expanduser("~/.local/bin/piper")
+                if os.path.exists(home_piper) and not os.path.isdir(home_piper):
+                    self.piper_bin = home_piper
 
         if not self.voice_model and not self.piper_bin:
             logger.warning(

@@ -15,7 +15,9 @@ from src.audio.output import BaseAudioOutput, Speaker
 from src.vad.silero_vad import BaseVAD, SileroVAD
 from src.stt.whisper import BaseSTT, WhisperSTT
 from src.llm.qwen import BaseLLM, QwenLLM
+from src.llm.gemini import GeminiLLM
 from src.tts.kokoro import BaseTTS, KokoroTTS
+from src.tts.factory import get_tts_engine
 from src.pipeline.remote_client import RemotePipelineClient
 
 logger = logging.getLogger(__name__)
@@ -83,18 +85,22 @@ class VoicePipeline:
                 compute_type=config.whisper_compute_type,
             )
 
-            # Component 4: Qwen via Ollama LLM
-            self.llm = llm or QwenLLM(
-                base_url=config.ollama_base_url,
-                model_name=config.ollama_model,
-            )
+            # Component 4: LLM (Gemini or Qwen via Ollama)
+            if llm is not None:
+                self.llm = llm
+            elif config.llm_provider.lower() == "gemini":
+                self.llm = GeminiLLM(
+                    api_key=config.gemini_api_key,
+                    model_name=config.gemini_model,
+                )
+            else:
+                self.llm = QwenLLM(
+                    base_url=config.ollama_base_url,
+                    model_name=config.ollama_model,
+                )
 
-            # Component 5: Kokoro TTS
-            self.tts = tts or KokoroTTS(
-                voice=config.kokoro_voice,
-                sample_rate=config.sample_rate,
-                device=config.kokoro_device,
-            )
+            # Component 5: Multi-engine TTS (Edge, Piper, or Kokoro)
+            self.tts = tts or get_tts_engine(config)
 
         self.is_running: bool = False
         logger.info("[Pipeline] VoicePipeline initialized successfully (mode=%s).", config.pipeline_mode)

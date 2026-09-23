@@ -82,7 +82,13 @@ def main() -> None:
             logger.info("  OLLAMA_MODEL: %s", config.ollama_model)
         logger.info("  WHISPER_MODEL: %s", config.whisper_model)
         logger.info("  WHISPER_DEVICE: %s", config.whisper_device)
-        logger.info("  KOKORO_VOICE: %s", config.kokoro_voice)
+        logger.info("  TTS_ENGINE: %s", config.tts_engine)
+        if config.tts_engine.lower() in ("edge", "edge-tts"):
+            logger.info("  EDGE_VOICE: %s", config.edge_voice)
+        elif config.tts_engine.lower() in ("piper", "piper-tts"):
+            logger.info("  PIPER_VOICE: %s", config.piper_voice)
+        else:
+            logger.info("  KOKORO_VOICE: %s", config.kokoro_voice)
     logger.info("  VAD_THRESHOLD: %.2f", config.vad_threshold)
 
     # Initialize modular voice pipeline

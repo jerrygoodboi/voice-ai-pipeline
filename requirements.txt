@@ -17,7 +17,8 @@ requests>=2.31.0
 python-dotenv>=1.0.0
 google-genai>=0.1.0
 
-# Text-to-Speech (Kokoro TTS)
+# Text-to-Speech (Multi-Engine: Edge, Piper, Kokoro)
+edge-tts>=6.1.9
 kokoro-onnx>=0.6.1
 pyttsx3>=2.90
 

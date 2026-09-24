@@ -35,6 +35,11 @@ document.addEventListener('DOMContentLoaded', () => {
   let isContinuousMode = false;
   let currentTurnId = 0;
 
+  let lastUserPrompt = '';
+  let lastAssistantResponseText = '';
+  let lastAssistantMessageElem = null;
+  let interruptedTurnContext = null;
+
   let currentAudioSource = null;
   let currentAbortController = null;
   let currentPlaceholderMsg = null;
@@ -241,7 +246,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     try {
       if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-        try { mediaRecorder.stop(); } catch (e) {}
+        try { mediaRecorder.stop(); } catch (e) { }
       }
       const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
         ? 'audio/webm;codecs=opus'
@@ -266,7 +271,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setState(States.PROCESSING, 'Finalizing utterance...');
 
     if (recognition) {
-      try { recognition.stop(); } catch (e) {}
+      try { recognition.stop(); } catch (e) { }
       recognition = null;
     }
 
@@ -291,8 +296,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Interruption trigger when user speaks over AI audio/processing
   function triggerInterruption() {
+    if (currentState === States.AI_SPEAKING || currentState === States.PROCESSING) {
+      interruptedTurnContext = {
+        previousUserPrompt: lastUserPrompt,
+        previousAssistantText: lastAssistantResponseText,
+        targetAssistantElem: lastAssistantMessageElem,
+        wasInterrupted: true
+      };
+    }
     stopAllPlaybackAndProcessing("barge_in");
     currentTurnId++; // Invalidate stale turn responses
+
+    if (recognition) {
+      try { recognition.stop(); } catch (e) { }
+      recognition = null;
+    }
+    liveSpokenText = '';
+    messageInput.value = '';
 
     setState(States.INTERRUPTED);
 
@@ -309,7 +329,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (currentAudioSource) {
       try {
         currentAudioSource.stop();
-      } catch (e) {}
+      } catch (e) { }
       currentAudioSource = null;
       console.log("[AUDIO] PLAYBACK STOPPED");
       wasActive = true;
@@ -318,7 +338,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (currentAbortController) {
       try {
         currentAbortController.abort();
-      } catch (e) {}
+      } catch (e) { }
       currentAbortController = null;
       wasActive = true;
     }
@@ -361,11 +381,11 @@ document.addEventListener('DOMContentLoaded', () => {
       console.log("[MIC] MICROPHONE STOPPED");
       stopAllPlaybackAndProcessing("mic_toggle_off");
       if (recognition) {
-        try { recognition.stop(); } catch (e) {}
+        try { recognition.stop(); } catch (e) { }
         recognition = null;
       }
       if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-        try { mediaRecorder.stop(); } catch (e) {}
+        try { mediaRecorder.stop(); } catch (e) { }
       }
       setState(States.IDLE);
     }
@@ -377,8 +397,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     try {
       if (recognition) {
-        try { recognition.stop(); } catch (e) {}
+        try { recognition.stop(); } catch (e) { }
+        recognition = null;
       }
+      liveSpokenText = '';
       recognition = new SpeechRecognition();
       recognition.continuous = true;
       recognition.interimResults = true;
@@ -398,6 +420,7 @@ document.addEventListener('DOMContentLoaded', () => {
           if (currentState === States.AI_SPEAKING || currentState === States.PROCESSING) {
             console.log("[INTERRUPT] USER INTERRUPTED AI");
             triggerInterruption();
+            return;
           }
 
           liveSpokenText = text;
@@ -407,15 +430,15 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       };
 
-      recognition.onerror = () => {};
+      recognition.onerror = () => { };
       recognition.onend = () => {
         if (isContinuousMode && currentState === States.USER_SPEAKING && recognition) {
-          try { recognition.start(); } catch (e) {}
+          try { recognition.start(); } catch (e) { }
         }
       };
 
       recognition.start();
-    } catch (e) {}
+    } catch (e) { }
   }
 
   // Turn Execution Pipeline: Whisper STT -> Gemini -> Piper TTS -> Web Audio Playback
@@ -467,22 +490,33 @@ document.addEventListener('DOMContentLoaded', () => {
     appendMessage({ sender: 'user', name: 'You', text: finalPrompt, time: getCurrentTime() });
     messageInput.value = '';
 
+    // Save current prompt for context tracking and retrieve any active interruption context
+    lastUserPrompt = finalPrompt;
+    const ctxToSend = interruptedTurnContext;
+    interruptedTurnContext = null;
+
     // 2. Gemini LLM Generation
     setState(States.PROCESSING, 'Gemini Thinking...');
     currentPlaceholderMsg = appendPlaceholderMessage();
 
     let aiResponse = '';
     try {
+      const payload = { prompt: finalPrompt };
+      if (ctxToSend) {
+        payload.interrupted_context = ctxToSend;
+      }
+
       const genRes = await fetch('/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: finalPrompt }),
+        body: JSON.stringify(payload),
         signal: signal
       });
 
       if (!genRes.ok) throw new Error(`Gemini Error (HTTP ${genRes.status})`);
       const genData = await genRes.json();
       aiResponse = genData.response || 'No response received.';
+      lastAssistantResponseText = aiResponse;
     } catch (err) {
       if (err.name === 'AbortError') {
         console.log(`[Turn ${turnId}] LLM request aborted by user interruption.`);
@@ -517,7 +551,21 @@ document.addEventListener('DOMContentLoaded', () => {
       removePlaceholderMessage(currentPlaceholderMsg);
       currentPlaceholderMsg = null;
     }
-    appendMessage({ sender: 'assistant', name: 'Gemini Voice AI', text: aiResponse, time: getCurrentTime() });
+
+    if (ctxToSend && ctxToSend.targetAssistantElem && document.body.contains(ctxToSend.targetAssistantElem)) {
+      // Continuation turn: Merge text into existing assistant message bubble!
+      lastAssistantMessageElem = ctxToSend.targetAssistantElem;
+      const combinedText = (ctxToSend.previousAssistantText + " " + aiResponse).trim();
+      lastAssistantResponseText = combinedText;
+      const textNode = lastAssistantMessageElem.querySelector('.message-text');
+      if (textNode) {
+        textNode.textContent = combinedText;
+      }
+    } else {
+      // Standard turn: Append new assistant message bubble
+      lastAssistantResponseText = aiResponse;
+      lastAssistantMessageElem = appendMessage({ sender: 'assistant', name: 'Gemini Voice AI', text: aiResponse, time: getCurrentTime() });
+    }
 
     // 3. Piper TTS Synthesis
     setState(States.PROCESSING, 'Synthesizing Piper TTS...');
@@ -639,6 +687,7 @@ document.addEventListener('DOMContentLoaded', () => {
     `;
     chatContainer.appendChild(msgDiv);
     chatContainer.scrollTop = chatContainer.scrollHeight;
+    return msgDiv;
   }
 
   function appendPlaceholderMessage() {

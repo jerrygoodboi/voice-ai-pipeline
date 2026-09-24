@@ -93,6 +93,28 @@ class TestServerEndpoints(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"response": "mock answer to what is AI?"})
 
+    def test_generate_endpoint_with_interrupted_context(self) -> None:
+        payload = {
+            "prompt": "explain machine learning",
+            "interrupted_context": {
+                "previousUserPrompt": "what is AI?",
+                "previousAssistantText": "AI is artificial intelligence...",
+                "wasInterrupted": True
+            }
+        }
+        response = self.client.post("/generate", json=payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue("response" in response.json())
+
+    def test_generate_endpoint_with_empty_interrupted_context(self) -> None:
+        payload = {
+            "prompt": "what is deep learning?",
+            "interrupted_context": {}
+        }
+        response = self.client.post("/generate", json=payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"response": "mock answer to what is deep learning?"})
+
     def test_synthesize_endpoint(self) -> None:
         response = self.client.post("/synthesize", json={"text": "hello world"})
         self.assertEqual(response.status_code, 200)

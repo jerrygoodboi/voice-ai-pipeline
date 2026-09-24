@@ -35,6 +35,7 @@ logger = logging.getLogger("voice-ai-server")
 
 class PromptRequest(BaseModel):
     prompt: str
+    interrupted_context: dict | None = None
 
 
 class SynthesizeRequest(BaseModel):
@@ -364,8 +365,25 @@ def create_app(
 
     @app.post("/generate")
     async def generate(req: PromptRequest):
-        """Standalone LLM prompt generation endpoint."""
-        response_text = _llm.generate_response(req.prompt)
+        """Standalone LLM prompt generation endpoint with optional conversation continuation context."""
+        prompt_text = req.prompt
+        if req.interrupted_context and isinstance(req.interrupted_context, dict):
+            prev_user = req.interrupted_context.get("previousUserPrompt", "").strip()
+            prev_ai = req.interrupted_context.get("previousAssistantText", "").strip()
+            if prev_user or prev_ai:
+                prompt_text = (
+                    f"The user interrupted an answer that was already spoken aloud.\n\n"
+                    f"Previous user request:\n{prev_user}\n\n"
+                    f"Portion of the assistant answer that was already spoken:\n{prev_ai}\n\n"
+                    f"The user's new interruption/request:\n{req.prompt}\n\n"
+                    f"Continue the conversation naturally.\n"
+                    f"Do not repeat the portion of the answer that has already been spoken.\n"
+                    f"Address the user's new request and continue from the existing context.\n"
+                    f"Return only the new spoken content that should be played after the already-spoken answer.\n"
+                    f"Do not use markdown, bullets, headings, or meta commentary."
+                )
+
+        response_text = _llm.generate_response(prompt_text)
         return JSONResponse({"response": response_text})
 
     @app.post("/synthesize")

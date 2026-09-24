@@ -99,12 +99,17 @@ class WhisperSTT(BaseSTT):
             else:
                 audio_array = audio_data.astype(np.float32)
 
+            # Pad short audio clips (<0.5s) to 0.5s for Whisper model stability
+            min_samples = int(16000 * 0.5)
+            if len(audio_array) < min_samples:
+                audio_array = np.pad(audio_array, (0, min_samples - len(audio_array)), mode="constant")
+
             segments, info = self.model.transcribe(
                 audio_array,
                 beam_size=beam_size,
                 language="en",
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=400, threshold=0.4),
+                vad_filter=False,
+                condition_on_previous_text=False,
             )
 
             text_chunks = [segment.text.strip() for segment in segments if segment.text.strip()]

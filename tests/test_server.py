@@ -122,6 +122,45 @@ class TestServerEndpoints(unittest.TestCase):
         audio = np.frombuffer(response.content, dtype=np.float32)
         self.assertEqual(len(audio), 24000)
 
+    def test_generate_endpoint_with_conversation_history(self) -> None:
+        payload = {
+            "prompt": "Tell me about deep learning",
+            "conversation_history": [
+                {"role": "user", "content": "What is AI?"},
+                {"role": "assistant", "content": "AI is artificial intelligence."},
+                {"role": "user", "content": "What about machine learning?"},
+                {"role": "assistant", "content": "Machine learning is a subset of AI."}
+            ]
+        }
+        response = self.client.post("/generate", json=payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("response", response.json())
+        self.assertIn("Tell me about deep learning", response.json()["response"])
+
+    def test_generate_endpoint_empty_history(self) -> None:
+        payload = {
+            "prompt": "Tell me something about artificial intelligence",
+            "conversation_history": []
+        }
+        response = self.client.post("/generate", json=payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("response", response.json())
+        self.assertEqual(response.json()["response"], "mock answer to Tell me something about artificial intelligence")
+
+    def test_short_and_long_queries(self) -> None:
+        queries = [
+            "What is AI?",
+            "Who are you?",
+            "Why is the sky blue?",
+            "What is machine learning?",
+            "Can you explain quantum computing in detail?"
+        ]
+        for q in queries:
+            response = self.client.post("/generate", json={"prompt": q})
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("response", response.json())
+            self.assertIn(q, response.json()["response"])
+
 
 if __name__ == "__main__":
     unittest.main()

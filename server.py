@@ -23,6 +23,7 @@ from src.llm import BaseLLM, create_llm_engine
 from src.tts.kokoro import BaseTTS, KokoroTTS
 
 from src.tts.factory import get_tts_engine
+from src.llm.session import SessionManager
 
 # Configure logging
 logging.basicConfig(
@@ -35,7 +36,12 @@ logger = logging.getLogger("voice-ai-server")
 
 class PromptRequest(BaseModel):
     prompt: str
+    session_id: str | None = None
     interrupted_context: dict | None = None
+
+
+class SessionResetRequest(BaseModel):
+    session_id: str
 
 
 class SynthesizeRequest(BaseModel):
@@ -171,6 +177,7 @@ def create_app(
     )
     _llm = llm or create_llm_engine(cfg)
     _tts = tts or get_tts_engine(cfg)
+    _session_manager = SessionManager(max_tokens=1500)
 
     @app.get("/health")
     async def health_check():
@@ -237,12 +244,18 @@ def create_app(
 
         logger.info("[STT] TRANSCRIPTION: '%s'", transcription)
 
-        # 2. LLM response generation
-        ai_response = _llm.generate_response(transcription)
+        # 2. LLM response generation with session history
+        session_id = request.headers.get("X-Session-ID", "default")
+        history = _session_manager.get_history(session_id)
+        ai_response = _llm.generate_response(transcription, history=history)
         if not ai_response or not ai_response.strip():
             logger.warning("[Server] Empty response received from LLM.")
             _vad.reset()
             return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        _session_manager.add_turn(session_id, "user", transcription)
+        if ai_response and not ai_response.startswith("[Gemini Error"):
+            _session_manager.add_turn(session_id, "model", ai_response)
 
         logger.info("[LLM] GEMINI RESPONSE: '%s'", ai_response)
 
@@ -365,8 +378,12 @@ def create_app(
 
     @app.post("/generate")
     async def generate(req: PromptRequest):
-        """Standalone LLM prompt generation endpoint with optional conversation continuation context."""
+        """Standalone LLM prompt generation endpoint with in-memory multi-turn session history."""
         prompt_text = req.prompt
+        session_id = req.session_id or "default"
+
+        history = _session_manager.get_history(session_id)
+
         if req.interrupted_context and isinstance(req.interrupted_context, dict):
             prev_user = req.interrupted_context.get("previousUserPrompt", "").strip()
             prev_ai = req.interrupted_context.get("previousAssistantText", "").strip()
@@ -383,8 +400,23 @@ def create_app(
                     f"Do not use markdown, bullets, headings, or meta commentary."
                 )
 
-        response_text = _llm.generate_response(prompt_text)
-        return JSONResponse({"response": response_text})
+        response_text = _llm.generate_response(prompt_text, history=history)
+
+        # Record turns in in-memory session history
+        _session_manager.add_turn(session_id, "user", req.prompt)
+        if response_text and not response_text.startswith("[Gemini Error"):
+            _session_manager.add_turn(session_id, "model", response_text)
+
+        return JSONResponse(
+            {"response": response_text},
+            headers={"X-Session-ID": session_id}
+        )
+
+    @app.post("/session/reset")
+    async def reset_session(req: SessionResetRequest):
+        """Clear conversation history for a given session."""
+        _session_manager.reset_session(req.session_id)
+        return JSONResponse({"status": "ok", "session_id": req.session_id})
 
     @app.post("/synthesize")
     async def synthesize(req: SynthesizeRequest):

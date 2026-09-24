@@ -17,6 +17,10 @@ document.addEventListener('DOMContentLoaded', () => {
   const statusText = document.getElementById('statusText');
   const recordingBanner = document.getElementById('recordingBanner');
   const liveTranscriptText = document.getElementById('liveTranscriptText');
+  const newChatBtn = document.getElementById('newChatBtn');
+
+  // Session ID for in-memory multi-turn history (fresh on tab load)
+  let currentSessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
 
   // Configurable silence threshold for utterance finalization (ms)
   const SILENCE_DURATION_MS = 700;
@@ -501,7 +505,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let aiResponse = '';
     try {
-      const payload = { prompt: finalPrompt };
+      const payload = {
+        prompt: finalPrompt,
+        session_id: currentSessionId
+      };
       if (ctxToSend) {
         payload.interrupted_context = ctxToSend;
       }
@@ -671,6 +678,46 @@ document.addEventListener('DOMContentLoaded', () => {
     messageInput.value = '';
     processTurnPipeline(text, null);
   });
+
+  // "New Chat" Button Handler - Resets backend session and clears chat UI
+  if (newChatBtn) {
+    newChatBtn.addEventListener('click', async () => {
+      console.log("[Session] Resetting chat session: " + currentSessionId);
+      const oldSessionId = currentSessionId;
+      currentSessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+
+      try {
+        await fetch('/session/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: oldSessionId })
+        });
+      } catch (e) {
+        console.warn("[Session] Reset request error:", e);
+      }
+
+      stopAllPlaybackAndProcessing("new_chat");
+      interruptedTurnContext = null;
+      lastUserPrompt = '';
+      lastAssistantResponseText = '';
+
+      // Reset chat feed keeping clean welcome message
+      chatContainer.innerHTML = `
+        <div class="message assistant-message">
+          <div class="avatar assistant-avatar">AI</div>
+          <div class="message-content">
+            <div class="sender-name">Gemini Voice AI</div>
+            <div class="message-text">
+              Started a new conversation session. How can I help you today?
+            </div>
+            <span class="timestamp">Just now</span>
+          </div>
+        </div>
+      `;
+      appendSystemNotice("Conversation history reset.");
+      setState(States.IDLE);
+    });
+  }
 
   function appendMessage({ sender, name, text, time }) {
     const msgDiv = document.createElement('div');

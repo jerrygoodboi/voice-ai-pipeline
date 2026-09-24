@@ -3,14 +3,16 @@ Voice AI Pipeline Remote Processing Server.
 Exposes Whisper STT, Qwen LLM via Ollama, and Kokoro TTS as HTTP endpoints over Tailscale.
 """
 
+import asyncio
 import io
+import json
 import logging
 import sys
 import subprocess
 import urllib.parse
 import wave
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, HTTPException, Request, Response, status, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 import uvicorn
@@ -268,6 +270,87 @@ def create_app(
 
         return Response(content=audio_bytes, media_type="application/octet-stream", headers=headers)
 
+    @app.websocket("/ws/transcribe")
+    async def websocket_transcribe(websocket: WebSocket):
+        """
+        Real-time streaming speech transcription endpoint over WebSocket.
+        Receives binary PCM16 audio chunks (16000Hz mono).
+        Emits live word-by-word interim updates and finalized transcripts.
+        """
+        await websocket.accept()
+        logger.info("[WebSocket] Real-time STT client connected.")
+        pcm_chunks = []
+        total_samples = 0
+        is_transcribing = False
+        import time
+        last_transcribe_time = 0.0
+        loop = asyncio.get_event_loop()
+
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+
+                if "bytes" in message and message["bytes"]:
+                    data_bytes = message["bytes"]
+                    if len(data_bytes) >= 2:
+                        chunk_f32 = np.frombuffer(data_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                        pcm_chunks.append(chunk_f32)
+                        total_samples += len(chunk_f32)
+
+                    # Limit maximum rolling window to last 6 seconds (96000 samples)
+                    if total_samples > 96000:
+                        combined = np.concatenate(pcm_chunks)[-96000:]
+                        pcm_chunks = [combined]
+                        total_samples = len(combined)
+
+                    # Trigger sliding window transcribe when audio >= 0.5s (8000 samples) and throttled to every 500ms
+                    now = time.time()
+                    if not is_transcribing and total_samples >= 8000 and (now - last_transcribe_time >= 0.5):
+                        is_transcribing = True
+                        last_transcribe_time = now
+                        try:
+                            combined = np.concatenate(pcm_chunks)
+                            text = await loop.run_in_executor(None, _stt.transcribe, combined)
+                            if text and text.strip():
+                                await websocket.send_json({"type": "interim", "text": text.strip()})
+                        except Exception as e:
+                            logger.debug("[WebSocket STT] Interim error: %s", e)
+                        finally:
+                            is_transcribing = False
+
+                elif "text" in message and message["text"]:
+                    try:
+                        msg_json = json.loads(message["text"])
+                        msg_type = msg_json.get("type")
+                        if msg_type == "finalize":
+                            final_text = ""
+                            if pcm_chunks:
+                                combined = np.concatenate(pcm_chunks)
+                                if len(combined) >= 4000:
+                                    final_text = await loop.run_in_executor(None, _stt.transcribe, combined)
+                            await websocket.send_json({"type": "final", "text": (final_text or "").strip()})
+                            pcm_chunks.clear()
+                            total_samples = 0
+                            is_transcribing = False
+                        elif msg_type == "reset":
+                            pcm_chunks.clear()
+                            total_samples = 0
+                            is_transcribing = False
+                    except Exception as e:
+                        logger.debug("[WebSocket STT] Message error: %s", e)
+
+        except WebSocketDisconnect:
+            logger.info("[WebSocket] Real-time STT client disconnected.")
+        except Exception as e:
+            if "disconnect" not in str(e).lower():
+                logger.warning("[WebSocket] Connection error: %s", e)
+        finally:
+            pcm_chunks.clear()
+            total_samples = 0
+            is_transcribing = False
+
     @app.post("/transcribe")
     async def transcribe(request: Request, sample_rate: int = 16000):
         """Standalone speech transcription endpoint."""
@@ -275,7 +358,8 @@ def create_app(
         if not body:
             return JSONResponse({"text": ""})
         audio_array = decode_input_audio(body, sample_rate)
-        text = _stt.transcribe(audio_array)
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, _stt.transcribe, audio_array)
         return JSONResponse({"text": text})
 
     @app.post("/generate")
@@ -301,7 +385,14 @@ def create_app(
     import os
     if os.path.exists("web"):
         from fastapi.staticfiles import StaticFiles
-        app.mount("/", StaticFiles(directory="web", html=True), name="static")
+
+        class SafeStaticFiles(StaticFiles):
+            async def __call__(self, scope, receive, send):
+                if scope["type"] != "http":
+                    return
+                await super().__call__(scope, receive, send)
+
+        app.mount("/", SafeStaticFiles(directory="web", html=True), name="static")
 
     return app
 

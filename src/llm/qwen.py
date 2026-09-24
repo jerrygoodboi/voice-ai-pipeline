@@ -14,11 +14,12 @@ class BaseLLM(ABC):
     """Abstract interface for Large Language Models."""
 
     @abstractmethod
-    def generate_response(self, prompt: str) -> str:
+    def generate_response(self, prompt: str, history: list[dict[str, str]] | None = None) -> str:
         """
-        Generate text response for a given prompt string.
+        Generate text response for a given prompt string with optional conversation history.
 
         :param prompt: User prompt text
+        :param history: Optional list of previous turns [{'role': 'user'|'model', 'content': str}]
         :return: Generated text response
         """
         pass
@@ -89,7 +90,7 @@ class QwenLLM(BaseLLM):
             logger.error("[LLM] Ollama health check error: %s", e)
             return False
 
-    def generate_response(self, prompt: str) -> str:
+    def generate_response(self, prompt: str, history: list[dict[str, str]] | None = None) -> str:
         """
         Send text prompt to Qwen via Ollama REST API and return text response.
         """
@@ -98,10 +99,20 @@ class QwenLLM(BaseLLM):
 
         logger.info("[LLM] Sending text to Qwen...")
 
+        full_prompt = prompt
+        if history:
+            context_lines = []
+            for turn in history:
+                role = "User" if turn.get("role") == "user" else "Assistant"
+                context_lines.append(f"{role}: {turn.get('content', '')}")
+            context_lines.append(f"User: {prompt}")
+            context_lines.append("Assistant:")
+            full_prompt = "\n".join(context_lines)
+
         url = f"{self.base_url}/api/generate"
         payload = {
             "model": self.model_name,
-            "prompt": prompt,
+            "prompt": full_prompt,
             "stream": False,
             "keep_alive": -1,  # Pin model in VRAM indefinitely (no cold-load lag)
         }

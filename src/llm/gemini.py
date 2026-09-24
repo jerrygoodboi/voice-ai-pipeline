@@ -73,7 +73,13 @@ class GeminiLLM(BaseLLM):
         else:
             logger.info("[LLM] Initialized Gemini client (model=%s, IPv4 optimized, timeout=%.1fs).", self.model_name, self.timeout)
 
-    def _call_model(self, model: str, prompt: str, timeout: float) -> tuple[str | None, int]:
+    def _call_model(
+        self,
+        model: str,
+        prompt: str,
+        timeout: float,
+        history: list[dict[str, str]] | None = None,
+    ) -> tuple[str | None, int]:
         """Helper to invoke a specific Gemini model with low latency settings."""
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -86,8 +92,17 @@ class GeminiLLM(BaseLLM):
         if "gemini-3" in model.lower() or "2.5" in model.lower():
             gen_config["thinkingConfig"] = {"thinkingBudget": 0}
 
+        contents: list[dict[str, Any]] = []
+        if history:
+            for turn in history:
+                role = "user" if turn.get("role") == "user" else "model"
+                text = turn.get("content", "").strip()
+                if text:
+                    contents.append({"role": role, "parts": [{"text": text}]})
+        contents.append({"role": "user", "parts": [{"text": prompt}]})
+
         payload = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "contents": contents,
             "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
             "generationConfig": gen_config,
         }
@@ -110,7 +125,9 @@ class GeminiLLM(BaseLLM):
             logger.warning("[LLM] Model '%s' HTTP %d: %s", model, resp.status_code, resp.text[:120])
             return None, resp.status_code
 
-    def generate_response(self, prompt: str) -> str:
+    def generate_response(
+        self, prompt: str, history: list[dict[str, str]] | None = None
+    ) -> str:
         """
         Send text prompt to Gemini API and return concise conversational text response.
         Uses fast failover across high-speed models to prevent any hanging.
@@ -135,7 +152,7 @@ class GeminiLLM(BaseLLM):
 
         for m in models_to_try:
             try:
-                ans, status_code = self._call_model(m, prompt, timeout=self.timeout)
+                ans, status_code = self._call_model(m, prompt, timeout=self.timeout, history=history)
                 if ans:
                     logger.info("[LLM] GEMINI RESPONSE (%s): '%s'", m, ans)
                     return ans

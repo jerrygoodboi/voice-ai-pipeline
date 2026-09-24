@@ -21,7 +21,7 @@ class MockSTT(BaseSTT):
 
 
 class MockLLM(BaseLLM):
-    def generate_response(self, prompt: str) -> str:
+    def generate_response(self, prompt: str, history: list[dict[str, str]] | None = None) -> str:
         return f"mock answer to {prompt}"
 
     def check_ollama_status(self) -> bool:
@@ -160,6 +160,21 @@ class TestServerEndpoints(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertIn("response", response.json())
             self.assertIn(q, response.json()["response"])
+
+    def test_session_history_and_reset(self) -> None:
+        session_id = "test-session-123"
+        # Turn 1
+        res1 = self.client.post("/generate", json={"prompt": "Hi, my name is Jerry", "session_id": session_id})
+        self.assertEqual(res1.status_code, 200)
+
+        # Turn 2
+        res2 = self.client.post("/generate", json={"prompt": "What is my name?", "session_id": session_id})
+        self.assertEqual(res2.status_code, 200)
+
+        # Reset session
+        reset_res = self.client.post("/session/reset", json={"session_id": session_id})
+        self.assertEqual(reset_res.status_code, 200)
+        self.assertEqual(reset_res.json()["status"], "ok")
 
 
 if __name__ == "__main__":

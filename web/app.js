@@ -1,9 +1,11 @@
 /**
- * Voice AI Assistant Web Application - Robust Hybrid Engine with Voice Barge-In / Interruption
- * 1. Hardware Mic Capture (getUserMedia) with live AudioContext volume/VAD analysis.
- * 2. Active Voice Barge-In: Talking while audio is playing instantly cuts off the assistant and starts capturing user's new question.
- * 3. Fast failover Gemini + local Piper TTS pipeline with AbortController cancellation.
- * 4. Dual fallback: Web Speech API interim transcripts + local Whisper base offline transcription.
+ * Voice AI Assistant Web Application - Continuous Conversational Assistant Engine
+ * 1. Single Microphone Click: Persistent microphone MediaStream & AudioContext VAD.
+ * 2. Automatic Speech Detection: Continuous monitoring with ~700ms VAD silence finalization.
+ * 3. Continuous Conversation Loop: LISTENING -> USER_SPEAKING -> PROCESSING -> AI_SPEAKING -> LISTENING.
+ * 4. Real-time Voice Barge-In / Interruption: User voice instantly cuts off AI audio and starts capturing new query.
+ * 5. State Machine & Turn Cancellation: Epoch / turn ID validation prevents stale responses.
+ * 6. Explicit Logging: Standardized tag logging ([MIC], [VAD], [STT], [LLM], [TTS], [AUDIO], [INTERRUPT]).
  */
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -16,9 +18,22 @@ document.addEventListener('DOMContentLoaded', () => {
   const recordingBanner = document.getElementById('recordingBanner');
   const liveTranscriptText = document.getElementById('liveTranscriptText');
 
-  let isRecording = false;
-  let isProcessing = false;
-  let isPlayingAudio = false;
+  // Configurable silence threshold for utterance finalization (ms)
+  const SILENCE_DURATION_MS = 700;
+
+  // State Machine definitions
+  const States = {
+    IDLE: 'IDLE',
+    LISTENING: 'LISTENING',
+    USER_SPEAKING: 'USER_SPEAKING',
+    PROCESSING: 'PROCESSING',
+    AI_SPEAKING: 'AI_SPEAKING',
+    INTERRUPTED: 'INTERRUPTED'
+  };
+
+  let currentState = States.IDLE;
+  let isContinuousMode = false;
+  let currentTurnId = 0;
 
   let currentAudioSource = null;
   let currentAbortController = null;
@@ -36,7 +51,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   let recognition = null;
   let liveSpokenText = '';
-  let speechDetected = false;
   let silenceStartTime = null;
   let consecutiveSpeechFrames = 0;
   let noiseFloor = 0.002;
@@ -45,13 +59,70 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
-  // Initialize Mic Stream & Continuous VAD
+  function setState(newState, detail = '') {
+    const oldState = currentState;
+    currentState = newState;
+    console.log(`[STATE] ${oldState} -> ${newState}${detail ? ' (' + detail + ')' : ''}`);
+
+    switch (newState) {
+      case States.IDLE:
+        micBtn.classList.remove('recording');
+        statusBadge.className = 'status-badge';
+        statusText.textContent = 'Ready';
+        recordingBanner.classList.add('hidden');
+        messageInput.placeholder = 'Type your message or click microphone...';
+        break;
+
+      case States.LISTENING:
+        micBtn.classList.add('recording');
+        statusBadge.className = 'status-badge recording';
+        statusText.textContent = 'Listening...';
+        recordingBanner.classList.remove('hidden');
+        liveTranscriptText.textContent = 'Speak naturally... Listening';
+        messageInput.placeholder = 'Listening continuously... Speak anytime';
+        break;
+
+      case States.USER_SPEAKING:
+        micBtn.classList.add('recording');
+        statusBadge.className = 'status-badge recording';
+        statusText.textContent = 'User Speaking...';
+        recordingBanner.classList.remove('hidden');
+        if (!liveSpokenText) {
+          liveTranscriptText.textContent = 'Voice detected... Listening';
+        }
+        break;
+
+      case States.PROCESSING:
+        micBtn.classList.add('recording');
+        statusBadge.className = 'status-badge recording';
+        statusText.textContent = detail || 'Gemini Thinking...';
+        recordingBanner.classList.add('hidden');
+        break;
+
+      case States.AI_SPEAKING:
+        micBtn.classList.add('recording');
+        statusBadge.className = 'status-badge recording';
+        statusText.textContent = 'AI Speaking (Piper TTS)...';
+        recordingBanner.classList.add('hidden');
+        break;
+
+      case States.INTERRUPTED:
+        micBtn.classList.add('recording');
+        statusBadge.className = 'status-badge recording interrupted';
+        statusText.textContent = 'Interrupted! Listening...';
+        recordingBanner.classList.remove('hidden');
+        liveTranscriptText.textContent = 'Interrupted! Listening to your new question...';
+        break;
+    }
+  }
+
+  // Persistent Microphone MediaStream & VAD Setup
   async function ensureMicrophoneStream() {
     if (mediaStream && mediaStream.active) {
       return mediaStream;
     }
     try {
-      console.log("[Audio] Requesting microphone access with echo cancellation...");
+      console.log("[Audio] Requesting microphone access with noise suppression & echo cancellation...");
       mediaStream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -60,7 +131,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       });
 
-      // Setup permanent Web Audio VAD Analyser on this stream
       vadAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
       const sourceNode = vadAudioCtx.createMediaStreamSource(mediaStream);
       vadAnalyser = vadAudioCtx.createAnalyser();
@@ -75,11 +145,12 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (err) {
       console.error("[Audio] Microphone access error:", err);
       alert("Microphone access failed: " + err.message);
+      setState(States.IDLE);
       return null;
     }
   }
 
-  // Continuous VAD loop for silence detection and barge-in / interruption
+  // Continuous VAD Monitoring Loop
   function startContinuousVadLoop() {
     if (vadInterval) return;
 
@@ -93,25 +164,21 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       const rms = Math.sqrt(sumSq / vadDataArray.length);
 
-      // Noise floor estimation during quiescent periods
+      // Adaptively estimate background noise floor
       frameCount++;
       if (frameCount < 6) {
         noiseFloor = Math.max(0.001, (noiseFloor + rms) / 2);
         return;
       }
 
-      // 1. VOICE BARGE-IN / INTERRUPTION MONITOR
-      // If assistant is currently speaking or processing, listen for user speaking over it
-      if (isPlayingAudio || isProcessing) {
-        // Interruption threshold with safety margin above speaker acoustic bleed
+      // 1. BARGE-IN MONITOR (User speaks while AI is speaking or thinking)
+      if (currentState === States.AI_SPEAKING || currentState === States.PROCESSING) {
         const bargeInThreshold = Math.max(0.016, noiseFloor * 3.2);
-
         if (rms > bargeInThreshold) {
           consecutiveSpeechFrames++;
-          // Require 2 consecutive frames (~100ms) to prevent acoustic clicks triggering interruption
           if (consecutiveSpeechFrames >= 2) {
-            console.log("[Barge-In] User voice interruption detected (RMS: " + rms.toFixed(4) + ")! Halting assistant...");
             consecutiveSpeechFrames = 0;
+            console.log("[INTERRUPT] USER INTERRUPTED AI");
             triggerInterruption();
             return;
           }
@@ -121,12 +188,12 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
-      // 2. ACTIVE USER RECORDING VAD MONITOR
-      if (isRecording) {
+      // 2. ACTIVE SPEECH MONITORING (In LISTENING or USER_SPEAKING states)
+      if (isContinuousMode && (currentState === States.LISTENING || currentState === States.USER_SPEAKING || currentState === States.INTERRUPTED)) {
         const speechThreshold = Math.max(0.007, noiseFloor * 2.5);
         const silenceThreshold = Math.max(0.0035, noiseFloor * 1.4);
 
-        // Visual waveform feedback
+        // Update visual waveform
         const bars = document.querySelectorAll('.waveform-mini .bar');
         const level = Math.min(1.0, rms * 40);
         bars.forEach((bar, idx) => {
@@ -135,37 +202,108 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         if (rms > speechThreshold) {
-          if (!speechDetected) {
-            speechDetected = true;
-            if (!liveSpokenText) {
-              liveTranscriptText.textContent = 'Voice detected... Listening';
-            }
+          if (currentState !== States.USER_SPEAKING) {
+            console.log("[VAD] SPEECH START");
+            setState(States.USER_SPEAKING);
+            startChunkRecording();
           }
           silenceStartTime = null;
-        } else if (rms < silenceThreshold && speechDetected) {
+        } else if (rms < silenceThreshold && currentState === States.USER_SPEAKING) {
           if (silenceStartTime === null) {
             silenceStartTime = Date.now();
-          } else if (Date.now() - silenceStartTime >= 1000) {
-            // 1.0 second silence after speech -> auto-send
-            console.log("[Audio] 1.0s silence detected. Auto-finalizing utterance...");
-            liveTranscriptText.textContent = 'Finalizing speech with Whisper...';
-            stopCaptureAndSend(false);
+          } else if (Date.now() - silenceStartTime >= SILENCE_DURATION_MS) {
+            console.log(`[VAD] SPEECH END (${SILENCE_DURATION_MS}ms silence detected)`);
+            silenceStartTime = null;
+            finalizeUtterance();
             return;
           }
         }
 
         // Safety cap: auto-finalize after 7 seconds max
-        if (speechDetected && (Date.now() - captureStartTime > 7000)) {
-          console.log("[Audio] Max utterance duration reached. Finalizing...");
-          stopCaptureAndSend(false);
+        if (currentState === States.USER_SPEAKING && (Date.now() - captureStartTime > 7000)) {
+          console.log("[VAD] SPEECH END (7s max duration reached)");
+          silenceStartTime = null;
+          finalizeUtterance();
           return;
         }
       }
-    }, 50);
+    }, 40);
   }
 
-  // Stop all active audio playback and abort active HTTP pipeline requests
-  function stopAllPlaybackAndProcessing(reason = "interrupted") {
+  // Start recording raw audio chunk for the current user utterance
+  function startChunkRecording() {
+    audioChunks = [];
+    liveSpokenText = '';
+    captureStartTime = Date.now();
+    silenceStartTime = null;
+
+    if (!mediaStream) return;
+
+    try {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        try { mediaRecorder.stop(); } catch (e) {}
+      }
+      const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : MediaRecorder.isTypeSupported('audio/webm')
+          ? 'audio/webm'
+          : '';
+      mediaRecorder = new MediaRecorder(mediaStream, mime ? { mimeType: mime } : {});
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) audioChunks.push(e.data);
+      };
+      mediaRecorder.start(100);
+    } catch (err) {
+      console.error("[Audio] MediaRecorder creation error:", err);
+    }
+
+    setupLiveSpeechRecognition();
+  }
+
+  // Finalize the current user utterance and send through STT -> LLM -> TTS
+  function finalizeUtterance() {
+    if (currentState !== States.USER_SPEAKING) return;
+    setState(States.PROCESSING, 'Finalizing utterance...');
+
+    if (recognition) {
+      try { recognition.stop(); } catch (e) {}
+      recognition = null;
+    }
+
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.onstop = async () => {
+        let textToSend = (liveSpokenText || '').trim();
+        let audioBlob = null;
+
+        if (audioChunks.length > 0) {
+          audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+        }
+
+        audioChunks = [];
+        processTurnPipeline(textToSend, audioBlob);
+      };
+      mediaRecorder.stop();
+    } else {
+      let textToSend = (liveSpokenText || '').trim();
+      processTurnPipeline(textToSend, null);
+    }
+  }
+
+  // Interruption trigger when user speaks over AI audio/processing
+  function triggerInterruption() {
+    stopAllPlaybackAndProcessing("barge_in");
+    currentTurnId++; // Invalidate stale turn responses
+
+    setState(States.INTERRUPTED);
+
+    // Immediately start recording the new user query
+    console.log("[VAD] SPEECH START");
+    setState(States.USER_SPEAKING, 'Interrupted voice input');
+    startChunkRecording();
+  }
+
+  // Stop active playback and cancel in-flight HTTP requests
+  function stopAllPlaybackAndProcessing(reason = "cancelled") {
     let wasActive = false;
 
     if (currentAudioSource) {
@@ -173,6 +311,7 @@ document.addEventListener('DOMContentLoaded', () => {
         currentAudioSource.stop();
       } catch (e) {}
       currentAudioSource = null;
+      console.log("[AUDIO] PLAYBACK STOPPED");
       wasActive = true;
     }
 
@@ -189,89 +328,50 @@ document.addEventListener('DOMContentLoaded', () => {
       currentPlaceholderMsg = null;
     }
 
-    isPlayingAudio = false;
-    isProcessing = false;
     return wasActive;
   }
 
-  // Voice Barge-in trigger handler
-  async function triggerInterruption() {
-    stopAllPlaybackAndProcessing("barge_in");
-
-    statusBadge.className = 'status-badge recording interrupted';
-    statusText.textContent = 'Interrupted! Listening...';
-    recordingBanner.classList.remove('hidden');
-    liveTranscriptText.textContent = 'Interrupted! Listening to your voice...';
-    micBtn.classList.add('recording');
-
-    // Immediately start recording the new user query
-    await startCapture({ isInterrupted: true });
-  }
-
-  // Mic Button Click handler
+  // Single Microphone Click Handler (Toggle Continuous Mode ON/OFF)
   micBtn.addEventListener('click', async () => {
-    // If assistant is speaking or processing, clicking mic interrupts it immediately
-    if (isPlayingAudio || isProcessing) {
-      console.log("[Audio] Mic clicked during playback/processing. Interrupting...");
+    // If AI is speaking or processing, clicking mic interrupts it and keeps continuous mode ON
+    if (currentState === States.AI_SPEAKING || currentState === States.PROCESSING) {
+      console.log("[MIC] Mic clicked during AI response. Triggering barge-in interruption...");
       triggerInterruption();
       return;
     }
 
-    if (!isRecording) {
-      await startCapture();
+    if (!isContinuousMode) {
+      // Turn Continuous Mode ON
+      isContinuousMode = true;
+      console.log("[MIC] MICROPHONE STARTED");
+      const stream = await ensureMicrophoneStream();
+      if (!stream) {
+        isContinuousMode = false;
+        return;
+      }
+
+      if (vadAudioCtx && vadAudioCtx.state === 'suspended') {
+        await vadAudioCtx.resume();
+      }
+
+      setState(States.LISTENING);
     } else {
-      stopCaptureAndSend(false);
-    }
-  });
-
-  // Start capturing audio from user
-  async function startCapture(options = {}) {
-    const isInterrupted = options.isInterrupted || false;
-    const stream = await ensureMicrophoneStream();
-    if (!stream) return;
-
-    if (vadAudioCtx && vadAudioCtx.state === 'suspended') {
-      await vadAudioCtx.resume();
-    }
-
-    audioChunks = [];
-    liveSpokenText = '';
-    speechDetected = isInterrupted; // If interrupted, voice is already active
-    silenceStartTime = null;
-    captureStartTime = Date.now();
-    consecutiveSpeechFrames = 0;
-
-    // MediaRecorder for high-quality audio recording
-    try {
+      // Turn Continuous Mode OFF
+      isContinuousMode = false;
+      console.log("[MIC] MICROPHONE STOPPED");
+      stopAllPlaybackAndProcessing("mic_toggle_off");
+      if (recognition) {
+        try { recognition.stop(); } catch (e) {}
+        recognition = null;
+      }
       if (mediaRecorder && mediaRecorder.state !== 'inactive') {
         try { mediaRecorder.stop(); } catch (e) {}
       }
-      const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : MediaRecorder.isTypeSupported('audio/webm')
-          ? 'audio/webm'
-          : '';
-      mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) audioChunks.push(e.data);
-      };
-      mediaRecorder.start(100);
-    } catch (err) {
-      console.error("[Audio] MediaRecorder start error:", err);
+      setState(States.IDLE);
     }
+  });
 
-    isRecording = true;
-    micBtn.classList.add('recording');
-    statusBadge.className = isInterrupted ? 'status-badge recording interrupted' : 'status-badge recording';
-    statusText.textContent = isInterrupted ? 'Interrupted! Listening...' : 'Listening (Whisper Base)...';
-    recordingBanner.classList.remove('hidden');
-    liveTranscriptText.textContent = isInterrupted ? 'Interrupted! Speak your new question...' : 'Speak naturally... Listening';
-    messageInput.placeholder = 'Listening... (Auto-sends after 1s silence)';
-
-    setupLiveSpeechRecognition();
-  }
-
-  // Setup Web Speech API for real-time word streaming
+  // Web Speech API integration for streaming interim text
   function setupLiveSpeechRecognition() {
     if (!SpeechRecognition) return;
 
@@ -294,13 +394,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         const text = (final + interim).trim();
         if (text) {
-          // If assistant was speaking, WebSpeech recognized words also trigger instant barge-in
-          if (isPlayingAudio || isProcessing) {
+          // If AI is speaking, recognized words trigger instant barge-in
+          if (currentState === States.AI_SPEAKING || currentState === States.PROCESSING) {
+            console.log("[INTERRUPT] USER INTERRUPTED AI");
             triggerInterruption();
           }
 
           liveSpokenText = text;
-          speechDetected = true;
           liveTranscriptText.textContent = text;
           messageInput.value = text;
           silenceStartTime = Date.now();
@@ -309,7 +409,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       recognition.onerror = () => {};
       recognition.onend = () => {
-        if (isRecording && recognition) {
+        if (isContinuousMode && currentState === States.USER_SPEAKING && recognition) {
           try { recognition.start(); } catch (e) {}
         }
       };
@@ -318,99 +418,110 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (e) {}
   }
 
-  // Stop capturing audio and trigger processing
-  function stopCaptureAndSend(cancel = false) {
-    if (!isRecording) return;
-    isRecording = false;
+  // Turn Execution Pipeline: Whisper STT -> Gemini -> Piper TTS -> Web Audio Playback
+  async function processTurnPipeline(transcribedText, audioBlob) {
+    const turnId = ++currentTurnId;
+    stopAllPlaybackAndProcessing("new_turn");
 
-    if (recognition) {
-      try { recognition.stop(); } catch (e) {}
-      recognition = null;
-    }
-
-    micBtn.classList.remove('recording');
-    statusBadge.className = 'status-badge';
-    recordingBanner.classList.add('hidden');
-
-    if (cancel) {
-      statusText.textContent = 'Ready';
-      messageInput.value = '';
-      messageInput.placeholder = 'Type your message or click microphone...';
-      return;
-    }
-
-    statusText.textContent = 'Transcribing with Whisper...';
-
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-      mediaRecorder.onstop = async () => {
-        let textToSend = (liveSpokenText || '').trim();
-
-        // If Web Speech didn't supply text (e.g., in Thorium or Firefox), send audio chunk to Whisper
-        if (!textToSend && audioChunks.length > 0) {
-          try {
-            const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-            const resp = await fetch('/transcribe', {
-              method: 'POST',
-              body: audioBlob
-            });
-            if (resp.ok) {
-              const data = await resp.json();
-              textToSend = (data.text || '').trim();
-            }
-          } catch (err) {
-            console.error("[Transcribe Error]", err);
-          }
-        }
-
-        if (textToSend.length > 0) {
-          console.log("[Pipeline] Spoken text:", textToSend);
-          await handleTextPrompt(textToSend);
-        } else {
-          appendSystemNotice("No speech detected.");
-          statusBadge.className = 'status-badge';
-          statusText.textContent = 'Ready';
-          messageInput.placeholder = 'Type your message or click microphone...';
-        }
-      };
-      mediaRecorder.stop();
-    }
-  }
-
-  // Fast text route: /generate (Gemini 2.5) -> /synthesize (Piper)
-  async function handleTextPrompt(text) {
-    // If anything active, halt it cleanly
-    stopAllPlaybackAndProcessing("new_prompt");
-
-    isProcessing = true;
     currentAbortController = new AbortController();
     const signal = currentAbortController.signal;
 
-    appendMessage({ sender: 'user', name: 'You', text: text, time: getCurrentTime() });
+    let finalPrompt = (transcribedText || '').trim();
+
+    // 1. Whisper STT if raw audio is provided and no WebSpeech text was captured
+    if (!finalPrompt && audioBlob && audioBlob.size > 0) {
+      setState(States.PROCESSING, 'Transcribing with Whisper...');
+      try {
+        const resp = await fetch('/transcribe', {
+          method: 'POST',
+          body: audioBlob,
+          signal: signal
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          finalPrompt = (data.text || '').trim();
+        }
+      } catch (err) {
+        if (err.name !== 'AbortError') console.error("[STT Error]", err);
+      }
+    }
+
+    // Check race condition / cancellation
+    if (turnId !== currentTurnId || (!isContinuousMode && currentState === States.IDLE)) {
+      console.log(`[Turn ${turnId}] Stale request cancelled before LLM step.`);
+      return;
+    }
+
+    if (!finalPrompt) {
+      console.log("[VAD] Empty transcription / no speech detected.");
+      appendSystemNotice("No speech detected.");
+      if (isContinuousMode) {
+        setState(States.LISTENING);
+      } else {
+        setState(States.IDLE);
+      }
+      return;
+    }
+
+    console.log(`[STT] TRANSCRIPTION: '${finalPrompt}'`);
+    appendMessage({ sender: 'user', name: 'You', text: finalPrompt, time: getCurrentTime() });
     messageInput.value = '';
-    statusBadge.className = 'status-badge';
-    statusText.textContent = 'Gemini Thinking...';
+
+    // 2. Gemini LLM Generation
+    setState(States.PROCESSING, 'Gemini Thinking...');
     currentPlaceholderMsg = appendPlaceholderMessage();
 
+    let aiResponse = '';
     try {
       const genRes = await fetch('/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: text }),
+        body: JSON.stringify({ prompt: finalPrompt }),
         signal: signal
       });
 
       if (!genRes.ok) throw new Error(`Gemini Error (HTTP ${genRes.status})`);
       const genData = await genRes.json();
-      const aiResponse = genData.response || 'No response received.';
-
+      aiResponse = genData.response || 'No response received.';
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        console.log(`[Turn ${turnId}] LLM request aborted by user interruption.`);
+      } else {
+        console.error("[LLM Error]", err);
+        appendSystemNotice("Error: " + err.message);
+      }
       if (currentPlaceholderMsg) {
         removePlaceholderMessage(currentPlaceholderMsg);
         currentPlaceholderMsg = null;
       }
+      if (isContinuousMode && turnId === currentTurnId) {
+        setState(States.LISTENING);
+      } else if (turnId === currentTurnId) {
+        setState(States.IDLE);
+      }
+      return;
+    }
 
-      appendMessage({ sender: 'assistant', name: 'Gemini Voice AI', text: aiResponse, time: getCurrentTime() });
-      statusText.textContent = 'Speaking (Piper TTS)...';
+    // Check race condition
+    if (turnId !== currentTurnId) {
+      console.log(`[Turn ${turnId}] Response invalidated by newer user utterance.`);
+      if (currentPlaceholderMsg) {
+        removePlaceholderMessage(currentPlaceholderMsg);
+        currentPlaceholderMsg = null;
+      }
+      return;
+    }
 
+    console.log(`[LLM] GEMINI RESPONSE: '${aiResponse}'`);
+    if (currentPlaceholderMsg) {
+      removePlaceholderMessage(currentPlaceholderMsg);
+      currentPlaceholderMsg = null;
+    }
+    appendMessage({ sender: 'assistant', name: 'Gemini Voice AI', text: aiResponse, time: getCurrentTime() });
+
+    // 3. Piper TTS Synthesis
+    setState(States.PROCESSING, 'Synthesizing Piper TTS...');
+    try {
       const synRes = await fetch('/synthesize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -421,34 +532,35 @@ document.addEventListener('DOMContentLoaded', () => {
       if (synRes.ok && synRes.status !== 204) {
         const sr = parseInt(synRes.headers.get('X-Sample-Rate') || '22050', 10);
         const buf = await synRes.arrayBuffer();
-        if (buf && buf.byteLength > 0) {
-          isProcessing = false; // Transition to playing state
-          await playFloat32Audio(buf, sr);
+        if (buf && buf.byteLength > 0 && turnId === currentTurnId) {
+          const sampleCount = Math.floor(buf.byteLength / 4);
+          console.log(`[TTS] PIPER SYNTHESIS: ${sampleCount} samples`);
+          await playFloat32Audio(buf, sr, turnId);
+          return;
         }
       }
     } catch (err) {
       if (err.name === 'AbortError') {
-        console.log("[Pipeline] Processing aborted by user interruption.");
+        console.log(`[Turn ${turnId}] TTS synthesis aborted by user interruption.`);
       } else {
-        console.error("[Pipeline Error]", err);
-        appendSystemNotice("Error: " + err.message);
+        console.error("[TTS Error]", err);
       }
-      if (currentPlaceholderMsg) {
-        removePlaceholderMessage(currentPlaceholderMsg);
-        currentPlaceholderMsg = null;
-      }
-    } finally {
-      if (!isPlayingAudio && !isRecording) {
-        isProcessing = false;
-        statusBadge.className = 'status-badge';
-        statusText.textContent = 'Ready';
-        messageInput.placeholder = 'Type your message or click microphone...';
+    }
+
+    // Fallback if no audio or completed without audio playback
+    if (turnId === currentTurnId) {
+      if (isContinuousMode) {
+        setState(States.LISTENING);
+      } else {
+        setState(States.IDLE);
       }
     }
   }
 
-  // Audio Playback via Web Audio API with full interruption support
-  async function playFloat32Audio(arrayBuffer, sampleRate) {
+  // Audio Playback via Web Audio API with turn ID validation & interruption handling
+  async function playFloat32Audio(arrayBuffer, sampleRate, turnId) {
+    if (turnId !== currentTurnId) return;
+
     try {
       if (!audioCtx) {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
@@ -466,17 +578,21 @@ document.addEventListener('DOMContentLoaded', () => {
       source.connect(audioCtx.destination);
 
       currentAudioSource = source;
-      isPlayingAudio = true;
-      statusBadge.className = 'status-badge';
-      statusText.textContent = 'Speaking (Piper TTS)...';
+      setState(States.AI_SPEAKING);
+      console.log("[AUDIO] PLAYBACK START");
 
       return new Promise((resolve) => {
         source.onended = () => {
           if (currentAudioSource === source) {
             currentAudioSource = null;
-            isPlayingAudio = false;
-            statusBadge.className = 'status-badge';
-            statusText.textContent = 'Ready';
+            console.log("[AUDIO] PLAYBACK STOPPED");
+
+            // Automatically return to listening mode if continuous mode remains ON!
+            if (turnId === currentTurnId && isContinuousMode) {
+              setState(States.LISTENING);
+            } else if (turnId === currentTurnId) {
+              setState(States.IDLE);
+            }
           }
           resolve();
         };
@@ -484,25 +600,28 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     } catch (e) {
       console.error("[Audio Playback Error]", e);
-      isPlayingAudio = false;
       currentAudioSource = null;
+      if (turnId === currentTurnId && isContinuousMode) {
+        setState(States.LISTENING);
+      } else if (turnId === currentTurnId) {
+        setState(States.IDLE);
+      }
     }
   }
 
-  // Form text submit
+  // Manual Form Text Submit Handler
   chatForm.addEventListener('submit', async (e) => {
     e.preventDefault();
-    if (isPlayingAudio || isProcessing) {
+    const text = messageInput.value.trim();
+    if (!text) return;
+
+    if (currentState === States.AI_SPEAKING || currentState === States.PROCESSING) {
+      console.log("[INTERRUPT] USER INTERRUPTED AI via text submission");
       stopAllPlaybackAndProcessing("form_submit");
     }
-    if (isRecording) {
-      stopCaptureAndSend(false);
-      return;
-    }
-    const text = messageInput.value.trim();
-    if (text) {
-      await handleTextPrompt(text);
-    }
+
+    messageInput.value = '';
+    processTurnPipeline(text, null);
   });
 
   function appendMessage({ sender, name, text, time }) {

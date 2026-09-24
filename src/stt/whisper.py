@@ -77,7 +77,7 @@ class WhisperSTT(BaseSTT):
                 logger.critical("[STT] Whisper model loading failed completely: %s", fallback_err)
                 self.model = None
 
-    def transcribe(self, audio_data: np.ndarray | bytes) -> str:
+    def transcribe(self, audio_data: np.ndarray | bytes, beam_size: int = 1) -> str:
         """
         Transcribe speech audio array into text string.
         Ignores empty or silent audio inputs.
@@ -101,9 +101,10 @@ class WhisperSTT(BaseSTT):
 
             segments, info = self.model.transcribe(
                 audio_array,
-                beam_size=5,
+                beam_size=beam_size,
                 language="en",
-                vad_filter=False,  # Audio has already been segmented by Silero VAD
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=400, threshold=0.4),
             )
 
             text_chunks = [segment.text.strip() for segment in segments if segment.text.strip()]

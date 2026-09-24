@@ -1,7 +1,9 @@
 /**
- * Voice AI Assistant Interface Script
- * Automatic microphone recording & Voice AI Pipeline Integration:
- * Browser Mic -> Python Backend (Silero VAD -> Whisper STT -> Gemini -> Piper TTS) -> Browser Speaker
+ * Voice AI Assistant Web Application - Robust Hybrid Engine with Voice Barge-In / Interruption
+ * 1. Hardware Mic Capture (getUserMedia) with live AudioContext volume/VAD analysis.
+ * 2. Active Voice Barge-In: Talking while audio is playing instantly cuts off the assistant and starts capturing user's new question.
+ * 3. Fast failover Gemini + local Piper TTS pipeline with AbortController cancellation.
+ * 4. Dual fallback: Web Speech API interim transcripts + local Whisper base offline transcription.
  */
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -15,289 +17,444 @@ document.addEventListener('DOMContentLoaded', () => {
   const liveTranscriptText = document.getElementById('liveTranscriptText');
 
   let isRecording = false;
+  let isProcessing = false;
+  let isPlayingAudio = false;
+
+  let currentAudioSource = null;
+  let currentAbortController = null;
+  let currentPlaceholderMsg = null;
+
+  let mediaStream = null;
   let mediaRecorder = null;
   let audioChunks = [];
-  let mediaStream = null;
+
   let audioCtx = null;
-  let isProcessing = false;
-  let autoStopTimer = null;
-
-  let speechCheckInterval = null;
   let vadAudioCtx = null;
+  let vadInterval = null;
+  let vadAnalyser = null;
+  let vadDataArray = null;
 
-  // Single click starts automatic mic capture and pipeline processing
-  micBtn.addEventListener('click', async () => {
-    if (!isRecording) {
-      await startAutomaticRecording();
-    } else {
-      stopRecordingAndSend();
+  let recognition = null;
+  let liveSpokenText = '';
+  let speechDetected = false;
+  let silenceStartTime = null;
+  let consecutiveSpeechFrames = 0;
+  let noiseFloor = 0.002;
+  let frameCount = 0;
+  let captureStartTime = 0;
+
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  // Initialize Mic Stream & Continuous VAD
+  async function ensureMicrophoneStream() {
+    if (mediaStream && mediaStream.active) {
+      return mediaStream;
     }
-  });
-
-  async function startAutomaticRecording() {
     try {
-      console.log("[MIC] MIC STARTED");
-      audioChunks = [];
-      mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-      // Use native MediaRecorder
-      const options = MediaRecorder.isTypeSupported('audio/webm') ? { mimeType: 'audio/webm' } : {};
-      mediaRecorder = new MediaRecorder(mediaStream, options);
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          audioChunks.push(event.data);
+      console.log("[Audio] Requesting microphone access with echo cancellation...");
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
         }
-      };
+      });
 
-      mediaRecorder.start(100);
-      isRecording = true;
-
-      micBtn.classList.add('recording');
-      statusBadge.classList.add('recording');
-      statusText.textContent = 'Listening...';
-      recordingBanner.classList.remove('hidden');
-      liveTranscriptText.textContent = 'Listening... Speak now';
-      messageInput.placeholder = 'Listening for speech... (Auto-processing on silence)';
-
-      // Set up Web Audio API Analyser for real-time speech / silence detection
+      // Setup permanent Web Audio VAD Analyser on this stream
       vadAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
       const sourceNode = vadAudioCtx.createMediaStreamSource(mediaStream);
-      const analyser = vadAudioCtx.createAnalyser();
-      analyser.fftSize = 512;
-      sourceNode.connect(analyser);
+      vadAnalyser = vadAudioCtx.createAnalyser();
+      vadAnalyser.fftSize = 512;
+      sourceNode.connect(vadAnalyser);
 
-      const bufferLength = analyser.frequencyBinCount;
-      const dataArray = new Float32Array(bufferLength);
+      const bufferLength = vadAnalyser.frequencyBinCount;
+      vadDataArray = new Float32Array(bufferLength);
 
-      let speechStarted = false;
-      let silenceStartTime = null;
-      let speechStartTime = Date.now();
-
-      speechCheckInterval = setInterval(() => {
-        if (!isRecording) return;
-
-        analyser.getFloatTimeDomainData(dataArray);
-        let sumSq = 0;
-        for (let i = 0; i < dataArray.length; i++) {
-          sumSq += dataArray[i] * dataArray[i];
-        }
-        const rms = Math.sqrt(sumSq / dataArray.length);
-
-        const speechThreshold = 0.02; // Threshold for speech detection
-        const elapsedSinceStart = Date.now() - speechStartTime;
-
-        if (rms > speechThreshold) {
-          if (!speechStarted) {
-            speechStarted = true;
-            liveTranscriptText.textContent = 'Speech detected... Speaking...';
-          }
-          silenceStartTime = null;
-        } else {
-          if (speechStarted) {
-            if (silenceStartTime === null) {
-              silenceStartTime = Date.now();
-            } else if (Date.now() - silenceStartTime >= 700) { // 700ms of silence after speech
-              console.log("[MIC] Silence detected after speech. Finalizing utterance...");
-              stopRecordingAndSend();
-              return;
-            }
-          } else if (elapsedSinceStart > 10000) {
-            // Max silence timeout if user doesn't speak within 10s
-            console.log("[MIC] Timeout reached with no speech. Finalizing recording...");
-            stopRecordingAndSend();
-            return;
-          }
-        }
-      }, 50);
-
+      startContinuousVadLoop();
+      return mediaStream;
     } catch (err) {
-      console.error("Microphone access error:", err);
+      console.error("[Audio] Microphone access error:", err);
       alert("Microphone access failed: " + err.message);
+      return null;
     }
   }
 
-  function stopRecordingAndSend() {
-    if (!isRecording || !mediaRecorder) return;
+  // Continuous VAD loop for silence detection and barge-in / interruption
+  function startContinuousVadLoop() {
+    if (vadInterval) return;
+
+    vadInterval = setInterval(() => {
+      if (!vadAnalyser || !vadDataArray) return;
+
+      vadAnalyser.getFloatTimeDomainData(vadDataArray);
+      let sumSq = 0;
+      for (let i = 0; i < vadDataArray.length; i++) {
+        sumSq += vadDataArray[i] * vadDataArray[i];
+      }
+      const rms = Math.sqrt(sumSq / vadDataArray.length);
+
+      // Noise floor estimation during quiescent periods
+      frameCount++;
+      if (frameCount < 6) {
+        noiseFloor = Math.max(0.001, (noiseFloor + rms) / 2);
+        return;
+      }
+
+      // 1. VOICE BARGE-IN / INTERRUPTION MONITOR
+      // If assistant is currently speaking or processing, listen for user speaking over it
+      if (isPlayingAudio || isProcessing) {
+        // Interruption threshold with safety margin above speaker acoustic bleed
+        const bargeInThreshold = Math.max(0.016, noiseFloor * 3.2);
+
+        if (rms > bargeInThreshold) {
+          consecutiveSpeechFrames++;
+          // Require 2 consecutive frames (~100ms) to prevent acoustic clicks triggering interruption
+          if (consecutiveSpeechFrames >= 2) {
+            console.log("[Barge-In] User voice interruption detected (RMS: " + rms.toFixed(4) + ")! Halting assistant...");
+            consecutiveSpeechFrames = 0;
+            triggerInterruption();
+            return;
+          }
+        } else {
+          consecutiveSpeechFrames = 0;
+        }
+        return;
+      }
+
+      // 2. ACTIVE USER RECORDING VAD MONITOR
+      if (isRecording) {
+        const speechThreshold = Math.max(0.007, noiseFloor * 2.5);
+        const silenceThreshold = Math.max(0.0035, noiseFloor * 1.4);
+
+        // Visual waveform feedback
+        const bars = document.querySelectorAll('.waveform-mini .bar');
+        const level = Math.min(1.0, rms * 40);
+        bars.forEach((bar, idx) => {
+          const height = Math.max(4, Math.round(level * 24 * (0.6 + 0.4 * Math.sin(idx + Date.now() / 150))));
+          bar.style.height = `${height}px`;
+        });
+
+        if (rms > speechThreshold) {
+          if (!speechDetected) {
+            speechDetected = true;
+            if (!liveSpokenText) {
+              liveTranscriptText.textContent = 'Voice detected... Listening';
+            }
+          }
+          silenceStartTime = null;
+        } else if (rms < silenceThreshold && speechDetected) {
+          if (silenceStartTime === null) {
+            silenceStartTime = Date.now();
+          } else if (Date.now() - silenceStartTime >= 1000) {
+            // 1.0 second silence after speech -> auto-send
+            console.log("[Audio] 1.0s silence detected. Auto-finalizing utterance...");
+            liveTranscriptText.textContent = 'Finalizing speech with Whisper...';
+            stopCaptureAndSend(false);
+            return;
+          }
+        }
+
+        // Safety cap: auto-finalize after 7 seconds max
+        if (speechDetected && (Date.now() - captureStartTime > 7000)) {
+          console.log("[Audio] Max utterance duration reached. Finalizing...");
+          stopCaptureAndSend(false);
+          return;
+        }
+      }
+    }, 50);
+  }
+
+  // Stop all active audio playback and abort active HTTP pipeline requests
+  function stopAllPlaybackAndProcessing(reason = "interrupted") {
+    let wasActive = false;
+
+    if (currentAudioSource) {
+      try {
+        currentAudioSource.stop();
+      } catch (e) {}
+      currentAudioSource = null;
+      wasActive = true;
+    }
+
+    if (currentAbortController) {
+      try {
+        currentAbortController.abort();
+      } catch (e) {}
+      currentAbortController = null;
+      wasActive = true;
+    }
+
+    if (currentPlaceholderMsg) {
+      removePlaceholderMessage(currentPlaceholderMsg);
+      currentPlaceholderMsg = null;
+    }
+
+    isPlayingAudio = false;
+    isProcessing = false;
+    return wasActive;
+  }
+
+  // Voice Barge-in trigger handler
+  async function triggerInterruption() {
+    stopAllPlaybackAndProcessing("barge_in");
+
+    statusBadge.className = 'status-badge recording interrupted';
+    statusText.textContent = 'Interrupted! Listening...';
+    recordingBanner.classList.remove('hidden');
+    liveTranscriptText.textContent = 'Interrupted! Listening to your voice...';
+    micBtn.classList.add('recording');
+
+    // Immediately start recording the new user query
+    await startCapture({ isInterrupted: true });
+  }
+
+  // Mic Button Click handler
+  micBtn.addEventListener('click', async () => {
+    // If assistant is speaking or processing, clicking mic interrupts it immediately
+    if (isPlayingAudio || isProcessing) {
+      console.log("[Audio] Mic clicked during playback/processing. Interrupting...");
+      triggerInterruption();
+      return;
+    }
+
+    if (!isRecording) {
+      await startCapture();
+    } else {
+      stopCaptureAndSend(false);
+    }
+  });
+
+  // Start capturing audio from user
+  async function startCapture(options = {}) {
+    const isInterrupted = options.isInterrupted || false;
+    const stream = await ensureMicrophoneStream();
+    if (!stream) return;
+
+    if (vadAudioCtx && vadAudioCtx.state === 'suspended') {
+      await vadAudioCtx.resume();
+    }
+
+    audioChunks = [];
+    liveSpokenText = '';
+    speechDetected = isInterrupted; // If interrupted, voice is already active
+    silenceStartTime = null;
+    captureStartTime = Date.now();
+    consecutiveSpeechFrames = 0;
+
+    // MediaRecorder for high-quality audio recording
+    try {
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        try { mediaRecorder.stop(); } catch (e) {}
+      }
+      const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : MediaRecorder.isTypeSupported('audio/webm')
+          ? 'audio/webm'
+          : '';
+      mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) audioChunks.push(e.data);
+      };
+      mediaRecorder.start(100);
+    } catch (err) {
+      console.error("[Audio] MediaRecorder start error:", err);
+    }
+
+    isRecording = true;
+    micBtn.classList.add('recording');
+    statusBadge.className = isInterrupted ? 'status-badge recording interrupted' : 'status-badge recording';
+    statusText.textContent = isInterrupted ? 'Interrupted! Listening...' : 'Listening (Whisper Base)...';
+    recordingBanner.classList.remove('hidden');
+    liveTranscriptText.textContent = isInterrupted ? 'Interrupted! Speak your new question...' : 'Speak naturally... Listening';
+    messageInput.placeholder = 'Listening... (Auto-sends after 1s silence)';
+
+    setupLiveSpeechRecognition();
+  }
+
+  // Setup Web Speech API for real-time word streaming
+  function setupLiveSpeechRecognition() {
+    if (!SpeechRecognition) return;
+
+    try {
+      if (recognition) {
+        try { recognition.stop(); } catch (e) {}
+      }
+      recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      recognition.onresult = (event) => {
+        let interim = '';
+        let final = '';
+        for (let i = 0; i < event.results.length; ++i) {
+          const item = event.results[i];
+          if (item.isFinal) final += item[0].transcript + ' ';
+          else interim += item[0].transcript;
+        }
+        const text = (final + interim).trim();
+        if (text) {
+          // If assistant was speaking, WebSpeech recognized words also trigger instant barge-in
+          if (isPlayingAudio || isProcessing) {
+            triggerInterruption();
+          }
+
+          liveSpokenText = text;
+          speechDetected = true;
+          liveTranscriptText.textContent = text;
+          messageInput.value = text;
+          silenceStartTime = Date.now();
+        }
+      };
+
+      recognition.onerror = () => {};
+      recognition.onend = () => {
+        if (isRecording && recognition) {
+          try { recognition.start(); } catch (e) {}
+        }
+      };
+
+      recognition.start();
+    } catch (e) {}
+  }
+
+  // Stop capturing audio and trigger processing
+  function stopCaptureAndSend(cancel = false) {
+    if (!isRecording) return;
     isRecording = false;
 
-    if (speechCheckInterval) {
-      clearInterval(speechCheckInterval);
-      speechCheckInterval = null;
-    }
-    if (vadAudioCtx) {
-      vadAudioCtx.close().catch(() => {});
-      vadAudioCtx = null;
+    if (recognition) {
+      try { recognition.stop(); } catch (e) {}
+      recognition = null;
     }
 
     micBtn.classList.remove('recording');
-    statusBadge.classList.remove('recording');
-    statusText.textContent = 'Processing Pipeline...';
+    statusBadge.className = 'status-badge';
     recordingBanner.classList.add('hidden');
-    messageInput.placeholder = 'Processing audio (Silero VAD -> Whisper -> Gemini -> Piper)...';
 
-    mediaRecorder.onstop = async () => {
-      if (mediaStream) {
-        mediaStream.getTracks().forEach(track => track.stop());
-      }
+    if (cancel) {
+      statusText.textContent = 'Ready';
+      messageInput.value = '';
+      messageInput.placeholder = 'Type your message or click microphone...';
+      return;
+    }
 
-      const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-      await processAudioWithBackend(audioBlob);
-    };
+    statusText.textContent = 'Transcribing with Whisper...';
 
-    if (mediaRecorder.state !== 'inactive') {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.onstop = async () => {
+        let textToSend = (liveSpokenText || '').trim();
+
+        // If Web Speech didn't supply text (e.g., in Thorium or Firefox), send audio chunk to Whisper
+        if (!textToSend && audioChunks.length > 0) {
+          try {
+            const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+            const resp = await fetch('/transcribe', {
+              method: 'POST',
+              body: audioBlob
+            });
+            if (resp.ok) {
+              const data = await resp.json();
+              textToSend = (data.text || '').trim();
+            }
+          } catch (err) {
+            console.error("[Transcribe Error]", err);
+          }
+        }
+
+        if (textToSend.length > 0) {
+          console.log("[Pipeline] Spoken text:", textToSend);
+          await handleTextPrompt(textToSend);
+        } else {
+          appendSystemNotice("No speech detected.");
+          statusBadge.className = 'status-badge';
+          statusText.textContent = 'Ready';
+          messageInput.placeholder = 'Type your message or click microphone...';
+        }
+      };
       mediaRecorder.stop();
     }
   }
 
-  chatForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    if (isRecording) {
-      stopRecordingAndSend();
-    } else {
-      const text = messageInput.value.trim();
-      if (text) {
-        await handleTextMessageSubmit(text);
-      }
-    }
-  });
+  // Fast text route: /generate (Gemini 2.5) -> /synthesize (Piper)
+  async function handleTextPrompt(text) {
+    // If anything active, halt it cleanly
+    stopAllPlaybackAndProcessing("new_prompt");
 
-  async function processAudioWithBackend(audioBlob) {
-    if (isProcessing) return;
     isProcessing = true;
+    currentAbortController = new AbortController();
+    const signal = currentAbortController.signal;
 
-    const placeholderMsg = appendPlaceholderMessage();
-
-    try {
-      const response = await fetch('/process_speech', {
-        method: 'POST',
-        headers: {
-          'Content-Type': audioBlob.type || 'audio/webm'
-        },
-        body: audioBlob
-      });
-
-      removePlaceholderMessage(placeholderMsg);
-
-      if (response.status === 204) {
-        statusText.textContent = 'Ready';
-        messageInput.placeholder = 'Type your message or click microphone...';
-        appendSystemNotice("No speech or silence detected by VAD.");
-        isProcessing = false;
-        return;
-      }
-
-      if (!response.ok) {
-        throw new Error(`Server returned HTTP ${response.status}`);
-      }
-
-      const rawTrans = response.headers.get('X-Transcription') || '';
-      const rawResp = response.headers.get('X-Response-Text') || '';
-      const sampleRateHeader = response.headers.get('X-Sample-Rate') || '16000';
-
-      const transcription = rawTrans ? decodeURIComponent(rawTrans) : 'Speech Input';
-      const aiResponse = rawResp ? decodeURIComponent(rawResp) : 'No response text.';
-      const sampleRate = parseInt(sampleRateHeader, 10);
-
-      // 1. Display User Message from Whisper STT
-      appendMessage({
-        sender: 'user',
-        name: 'You',
-        text: transcription,
-        time: getCurrentTime()
-      });
-
-      // 2. Display Gemini Response Message
-      appendMessage({
-        sender: 'assistant',
-        name: 'Gemini Voice AI',
-        text: aiResponse,
-        time: getCurrentTime()
-      });
-
-      // 3. Play Piper Audio Response
-      const audioArrayBuffer = await response.arrayBuffer();
-      if (audioArrayBuffer && audioArrayBuffer.byteLength > 0) {
-        await playFloat32Audio(audioArrayBuffer, sampleRate);
-      } else {
-        statusText.textContent = 'Ready';
-        messageInput.placeholder = 'Type your message or click microphone...';
-        isProcessing = false;
-      }
-
-    } catch (err) {
-      console.error("Backend error:", err);
-      removePlaceholderMessage(placeholderMsg);
-      statusText.textContent = 'Ready';
-      messageInput.placeholder = 'Type your message or click microphone...';
-      appendSystemNotice("Pipeline Error: " + err.message);
-      isProcessing = false;
-    }
-  }
-
-  async function handleTextMessageSubmit(text) {
-    appendMessage({
-      sender: 'user',
-      name: 'You',
-      text: text,
-      time: getCurrentTime()
-    });
-
+    appendMessage({ sender: 'user', name: 'You', text: text, time: getCurrentTime() });
     messageInput.value = '';
+    statusBadge.className = 'status-badge';
     statusText.textContent = 'Gemini Thinking...';
-    const placeholderMsg = appendPlaceholderMessage();
+    currentPlaceholderMsg = appendPlaceholderMessage();
 
     try {
       const genRes = await fetch('/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: text })
+        body: JSON.stringify({ prompt: text }),
+        signal: signal
       });
+
+      if (!genRes.ok) throw new Error(`Gemini Error (HTTP ${genRes.status})`);
       const genData = await genRes.json();
-      const aiResponse = genData.response || '';
+      const aiResponse = genData.response || 'No response received.';
 
-      removePlaceholderMessage(placeholderMsg);
+      if (currentPlaceholderMsg) {
+        removePlaceholderMessage(currentPlaceholderMsg);
+        currentPlaceholderMsg = null;
+      }
 
-      appendMessage({
-        sender: 'assistant',
-        name: 'Gemini Voice AI',
-        text: aiResponse,
-        time: getCurrentTime()
-      });
+      appendMessage({ sender: 'assistant', name: 'Gemini Voice AI', text: aiResponse, time: getCurrentTime() });
+      statusText.textContent = 'Speaking (Piper TTS)...';
 
       const synRes = await fetch('/synthesize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: aiResponse })
+        body: JSON.stringify({ text: aiResponse }),
+        signal: signal
       });
 
-      if (synRes.ok) {
-        const srHeader = synRes.headers.get('X-Sample-Rate') || '16000';
-        const sampleRate = parseInt(srHeader, 10);
-        const audioArrayBuffer = await synRes.arrayBuffer();
-        if (audioArrayBuffer && audioArrayBuffer.byteLength > 0) {
-          await playFloat32Audio(audioArrayBuffer, sampleRate);
-        } else {
-          statusText.textContent = 'Ready';
+      if (synRes.ok && synRes.status !== 204) {
+        const sr = parseInt(synRes.headers.get('X-Sample-Rate') || '22050', 10);
+        const buf = await synRes.arrayBuffer();
+        if (buf && buf.byteLength > 0) {
+          isProcessing = false; // Transition to playing state
+          await playFloat32Audio(buf, sr);
         }
-      } else {
-        statusText.textContent = 'Ready';
       }
-
     } catch (err) {
-      console.error("Text submission error:", err);
-      removePlaceholderMessage(placeholderMsg);
-      statusText.textContent = 'Ready';
+      if (err.name === 'AbortError') {
+        console.log("[Pipeline] Processing aborted by user interruption.");
+      } else {
+        console.error("[Pipeline Error]", err);
+        appendSystemNotice("Error: " + err.message);
+      }
+      if (currentPlaceholderMsg) {
+        removePlaceholderMessage(currentPlaceholderMsg);
+        currentPlaceholderMsg = null;
+      }
+    } finally {
+      if (!isPlayingAudio && !isRecording) {
+        isProcessing = false;
+        statusBadge.className = 'status-badge';
+        statusText.textContent = 'Ready';
+        messageInput.placeholder = 'Type your message or click microphone...';
+      }
     }
   }
 
+  // Audio Playback via Web Audio API with full interruption support
   async function playFloat32Audio(arrayBuffer, sampleRate) {
-    statusText.textContent = 'Speaking...';
-    messageInput.placeholder = 'Assistant is speaking...';
-
     try {
       if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sampleRate });
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
+      }
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
       }
 
       const float32Array = new Float32Array(arrayBuffer);
@@ -308,56 +465,77 @@ document.addEventListener('DOMContentLoaded', () => {
       source.buffer = audioBuffer;
       source.connect(audioCtx.destination);
 
-      source.onended = () => {
-        console.log("[AUDIO] PLAYBACK COMPLETE");
-        statusText.textContent = 'Ready';
-        messageInput.placeholder = 'Type your message or click microphone...';
-        isProcessing = false;
-      };
+      currentAudioSource = source;
+      isPlayingAudio = true;
+      statusBadge.className = 'status-badge';
+      statusText.textContent = 'Speaking (Piper TTS)...';
 
-      source.start(0);
+      return new Promise((resolve) => {
+        source.onended = () => {
+          if (currentAudioSource === source) {
+            currentAudioSource = null;
+            isPlayingAudio = false;
+            statusBadge.className = 'status-badge';
+            statusText.textContent = 'Ready';
+          }
+          resolve();
+        };
+        source.start(0);
+      });
     } catch (e) {
-      console.error("Audio playback error:", e);
-      statusText.textContent = 'Ready';
-      messageInput.placeholder = 'Type your message or click microphone...';
-      isProcessing = false;
+      console.error("[Audio Playback Error]", e);
+      isPlayingAudio = false;
+      currentAudioSource = null;
     }
   }
+
+  // Form text submit
+  chatForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (isPlayingAudio || isProcessing) {
+      stopAllPlaybackAndProcessing("form_submit");
+    }
+    if (isRecording) {
+      stopCaptureAndSend(false);
+      return;
+    }
+    const text = messageInput.value.trim();
+    if (text) {
+      await handleTextPrompt(text);
+    }
+  });
 
   function appendMessage({ sender, name, text, time }) {
     const msgDiv = document.createElement('div');
     msgDiv.className = `message ${sender}-message`;
-    const isUser = sender === 'user';
+    const avatarText = sender === 'user' ? 'U' : 'AI';
+
     msgDiv.innerHTML = `
-      <div class="avatar ${isUser ? 'user-avatar' : 'assistant-avatar'}">
-        ${isUser ? 'YOU' : 'AI'}
-      </div>
+      <div class="avatar ${sender}-avatar">${avatarText}</div>
       <div class="message-content">
-        <div class="sender-name">${name}</div>
+        <div class="sender-name">${escapeHtml(name)}</div>
         <div class="message-text">${escapeHtml(text)}</div>
         <span class="timestamp">${time}</span>
       </div>
     `;
     chatContainer.appendChild(msgDiv);
-    scrollToBottom();
+    chatContainer.scrollTop = chatContainer.scrollHeight;
   }
 
   function appendPlaceholderMessage() {
     const msgDiv = document.createElement('div');
-    msgDiv.className = 'message assistant-message placeholder-message';
+    msgDiv.className = 'message assistant-message placeholder-msg';
     msgDiv.innerHTML = `
       <div class="avatar assistant-avatar">AI</div>
       <div class="message-content">
         <div class="sender-name">Gemini Voice AI</div>
-        <div class="message-text placeholder-loading">
-          <span class="loading-dot"></span>
-          <span class="loading-dot"></span>
-          <span class="loading-dot"></span>
+        <div class="typing-indicator">
+          <span></span><span></span><span></span>
         </div>
       </div>
     `;
     chatContainer.appendChild(msgDiv);
-    scrollToBottom();
+    chatContainer.scrollTop = chatContainer.scrollHeight;
     return msgDiv;
   }
 
@@ -368,26 +546,28 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function appendSystemNotice(text) {
-    const noticeDiv = document.createElement('div');
-    noticeDiv.style.textAlign = 'center';
-    noticeDiv.style.fontSize = '0.8rem';
-    noticeDiv.style.color = '#94a3b8';
-    noticeDiv.style.margin = '8px 0';
-    noticeDiv.textContent = text;
-    chatContainer.appendChild(noticeDiv);
-    scrollToBottom();
-  }
-
-  function scrollToBottom() {
+    const notice = document.createElement('div');
+    notice.className = 'system-notice';
+    notice.style.textAlign = 'center';
+    notice.style.fontSize = '0.8rem';
+    notice.style.color = '#94a3b8';
+    notice.style.margin = '8px 0';
+    notice.textContent = text;
+    chatContainer.appendChild(notice);
     chatContainer.scrollTop = chatContainer.scrollHeight;
   }
 
   function getCurrentTime() {
-    const now = new Date();
-    return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
 
   function escapeHtml(str) {
-    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return (str || '').replace(/[&<>"']/g, (m) => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    }[m]));
   }
 });

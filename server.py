@@ -38,6 +38,7 @@ class PromptRequest(BaseModel):
     prompt: str
     session_id: str | None = None
     interrupted_context: dict | None = None
+    conversation_history: list[dict[str, str]] | None = None
 
 
 class SessionResetRequest(BaseModel):

@@ -20,8 +20,8 @@ class PipelineConfig:
 
     # VAD (Silero) Settings
     vad_device: str = os.getenv("VAD_DEVICE", "cpu")
-    vad_threshold: float = float(os.getenv("VAD_THRESHOLD", "0.5"))
-    vad_min_speech_duration: float = float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.25"))
+    vad_threshold: float = float(os.getenv("VAD_THRESHOLD", "0.7"))
+    vad_min_speech_duration: float = float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.4"))
     vad_min_silence_duration: float = float(os.getenv("VAD_MIN_SILENCE_DURATION", "0.5"))
 
     # STT (Whisper) Settings

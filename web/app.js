@@ -39,10 +39,20 @@ document.addEventListener('DOMContentLoaded', () => {
   let isContinuousMode = false;
   let currentTurnId = 0;
 
+  const MAX_HISTORY_TURNS = 20;
+  let conversationHistory = [];
+
   let lastUserPrompt = '';
   let lastAssistantResponseText = '';
   let lastAssistantMessageElem = null;
   let interruptedTurnContext = null;
+
+  function clearSessionHistory() {
+    conversationHistory = [];
+    interruptedTurnContext = null;
+    console.log("[SESSION] Conversation history cleared.");
+  }
+  window.clearSessionHistory = clearSessionHistory;
 
   let currentAudioSource = null;
   let currentAbortController = null;
@@ -474,7 +484,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Check race condition / cancellation
-    if (turnId !== currentTurnId || (!isContinuousMode && currentState === States.IDLE)) {
+    if (turnId !== currentTurnId) {
       console.log(`[Turn ${turnId}] Stale request cancelled before LLM step.`);
       return;
     }
@@ -510,8 +520,14 @@ document.addEventListener('DOMContentLoaded', () => {
         session_id: currentSessionId
       };
       if (ctxToSend) {
-        payload.interrupted_context = ctxToSend;
+        payload.interrupted_context = {
+          previousUserPrompt: ctxToSend.previousUserPrompt || '',
+          previousAssistantText: ctxToSend.previousAssistantText || '',
+          wasInterrupted: !!ctxToSend.wasInterrupted
+        };
       }
+
+      console.log("[DEBUG] Sending /generate payload:", payload);
 
       const genRes = await fetch('/generate', {
         method: 'POST',
@@ -559,19 +575,16 @@ document.addEventListener('DOMContentLoaded', () => {
       currentPlaceholderMsg = null;
     }
 
-    if (ctxToSend && ctxToSend.targetAssistantElem && document.body.contains(ctxToSend.targetAssistantElem)) {
-      // Continuation turn: Merge text into existing assistant message bubble!
-      lastAssistantMessageElem = ctxToSend.targetAssistantElem;
-      const combinedText = (ctxToSend.previousAssistantText + " " + aiResponse).trim();
-      lastAssistantResponseText = combinedText;
-      const textNode = lastAssistantMessageElem.querySelector('.message-text');
-      if (textNode) {
-        textNode.textContent = combinedText;
-      }
-    } else {
-      // Standard turn: Append new assistant message bubble
-      lastAssistantResponseText = aiResponse;
-      lastAssistantMessageElem = appendMessage({ sender: 'assistant', name: 'Gemini Voice AI', text: aiResponse, time: getCurrentTime() });
+    // Append new assistant message bubble for every response turn
+    lastAssistantResponseText = aiResponse;
+    lastAssistantMessageElem = appendMessage({ sender: 'assistant', name: 'Gemini Voice AI', text: aiResponse, time: getCurrentTime() });
+
+    // Add user prompt and assistant response to conversation history
+    conversationHistory.push({ role: 'user', content: finalPrompt });
+    conversationHistory.push({ role: 'assistant', content: aiResponse });
+
+    if (conversationHistory.length > MAX_HISTORY_TURNS) {
+      conversationHistory = conversationHistory.slice(-MAX_HISTORY_TURNS);
     }
 
     // 3. Piper TTS Synthesis

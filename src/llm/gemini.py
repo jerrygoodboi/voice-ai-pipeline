@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_INSTRUCTION = (
     "You are a helpful, fast, and natural voice assistant. "
-    "Keep responses concise (1 to 2 sentences maximum), friendly, and conversational. "
+    "Keep responses natural, friendly, and conversational. "
+    "Keep general responses concise unless the user specifically asks for a story, detailed explanation, or lengthier output. "
     "Do NOT use markdown formatting, bullet points, asterisks, or emoji, as your response will be read aloud by a text-to-speech engine."
 )
 
@@ -87,7 +88,7 @@ class GeminiLLM(BaseLLM):
         )
         gen_config: dict[str, Any] = {
             "temperature": 0.5,
-            "maxOutputTokens": 75,
+            "maxOutputTokens": 500,
         }
         if "gemini-3" in model.lower() or "2.5" in model.lower():
             gen_config["thinkingConfig"] = {"thinkingBudget": 0}
